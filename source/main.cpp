@@ -154,13 +154,35 @@ void run_on(exec::io_uring_context& ctx, Sender&& sndr) {
     | stdexec::then([](auto&&...) noexcept {}));
 }
 
+struct message_header {
+  uint32_t object_id;
+  uint16_t opcode;
+  uint16_t message_length;
+};
+
+struct get_registry {
+  message_header header;
+  uint32_t name;
+};
+
 int main() {
   using namespace wayland;
   exec::io_uring_context context{};
 
+  get_registry msg = {
+    .header = {
+      .object_id = 1,
+      .opcode = 1,
+      .message_length = sizeof(get_registry),
+    },
+    .name = 2,
+  };
+
   connection conn{context};
   auto run = sio::async::run(conn)                                                    //
-           | sio::let_value_each([](connection_handle h) { return stdexec::just(); }) //
+           | sio::let_value_each([&msg](connection_handle h) { 
+              return h.send(msg);
+            }) //
            | sio::ignore_all();
 
   run_on(context, std::move(run));

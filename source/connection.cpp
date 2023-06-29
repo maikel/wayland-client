@@ -25,6 +25,8 @@
 
 #include <exec/async_scope.hpp>
 
+#include <ranges>
+
 namespace wayland {
   using namespace sio;
 
@@ -92,11 +94,11 @@ namespace wayland {
 
   struct message_header {
     uint32_t object_id;
-    uint16_t message_length;
     uint16_t opcode;
+    uint16_t message_length;
   };
 
-  std::array<char, 2> to_chars(std::byte b) {
+  std::array<char, 2> to_hex(std::byte b) {
     static constexpr const char map[] = "0123456789ABCDEF";
     const auto c = std::bit_cast<unsigned char>(b);
     std::array<char, 2> result;
@@ -105,19 +107,60 @@ namespace wayland {
     return result;
   }
 
-  std::string to_chars(std::span<std::byte, 4> bs) {
+  std::string to_hex(std::span<std::byte, 4> bs) {
     std::string result(8, '\0');
     int counter = 0;
-    for (std::byte b: bs) {
-      auto chars = to_chars(b);
+    for (std::byte b: std::ranges::views::reverse(bs)) {
+      auto chars = to_hex(b);
       result[counter++] = chars[0];
       result[counter++] = chars[1];
     }
     return result;
   }
 
+  char to_char(std::byte b) {
+    if (std::isprint(static_cast<int>(b))) {
+      return static_cast<char>(b);
+    } else {
+      return '.';
+    }
+  }
+
+  std::string to_chars(std::span<std::byte, 4> b) {
+    return std::string{to_char(b[0]), to_char(b[1]), to_char(b[2]), to_char(b[3])};
+  }
+
+  void consume_front(std::span<std::byte>& buffer, std::string& hex, std::string& ascii) {
+    if (buffer.size() >= 4) {
+      std::span<std::byte, 4> column = buffer.subspan<0, 4>();
+      hex = to_hex(column);
+      ascii = to_chars(column);
+      buffer = buffer.subspan(4);
+    }
+  }
+
   void log_send_buffer(std::span<std::byte> buffer) {
     std::array<std::string, 8> columns{};
+    std::string first = "C->S:";
+    while (buffer.size() >= 4) {
+      consume_front(buffer, columns[0], columns[4]);
+      consume_front(buffer, columns[1], columns[5]);
+      consume_front(buffer, columns[2], columns[6]);
+      consume_front(buffer, columns[3], columns[7]);
+      log(
+        "connection",
+        "{:5} {:8} {:8} {:8} {:8} | {:4} {:4} {:4} {:4}",
+        first,
+        columns[0],
+        columns[1],
+        columns[2],
+        columns[3],
+        columns[4],
+        columns[5],
+        columns[6],
+        columns[7]);
+      first = "";
+    }
   }
 
   any_sender_of<> connection_handle::send(std::span<std::byte> buffer) {

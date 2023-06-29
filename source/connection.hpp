@@ -43,6 +43,12 @@ namespace wayland {
       return connection_;
     }
 
+    template <class Tp>
+    any_sender_of<> send(Tp& msg) {
+      std::span<std::byte> buffer(reinterpret_cast<std::byte*>(&msg), sizeof(Tp));
+      return send(buffer);
+    }
+
     any_sender_of<> send(std::span<std::byte> buffer);
     any_sequence_of<std::span<std::byte>> receive();
   };
