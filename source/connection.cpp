@@ -29,6 +29,7 @@
 #include <sio/tap.hpp>
 
 #include <exec/async_scope.hpp>
+#include <exec/finally.hpp>
 #include <exec/sequence/empty_sequence.hpp>
 #include <exec/repeat_effect_until.hpp>
 #include <exec/variant_sender.hpp>
@@ -77,7 +78,6 @@ namespace wayland {
       message_header header = extract_header(range_.subspan(position_));
       return range_.subspan(position_, header.message_length);
     }
-
     bool operator==(const buffer_sentinel&) const noexcept {
       return range_.size() < position_ + sizeof(message_header);
     }
@@ -293,13 +293,15 @@ namespace wayland {
                  return sio::async::read_some(socket, buffer.subspan(filled.size())) //
                       | stdexec::let_value([&context, &filled, buffer](int n) {
                           filled = buffer.subspan(0, filled.size() + n);
-                          return if_then_else(
-                            n == 0,
-                            stdexec::just() | stdexec::then([] {
-                              log("connection", "Disconnected from Wayland server.");
-                              return 0;
-                            }),
-                            process_buffer(context.scope_, context.receivers_, filled));
+                          return exec::finally(
+                            if_then_else(
+                              n == 0,
+                              stdexec::just() | stdexec::then([] {
+                                log("connection", "Disconnected from Wayland server.");
+                                return 0;
+                              }),
+                              process_buffer(context.scope_, context.receivers_, filled)),
+                            context.scope_.on_empty());
                         }) //
                       | stdexec::then([&](int n) {
                           auto consumed = filled.subspan(0, n);

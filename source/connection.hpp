@@ -39,10 +39,6 @@ namespace wayland {
       : connection_(&connection) {
     }
 
-    connection* get_resource() const noexcept {
-      return connection_;
-    }
-
     template <class Tp>
     any_sender_of<> send(Tp& msg) {
       std::span<std::byte> buffer(reinterpret_cast<std::byte*>(&msg), sizeof(Tp));
@@ -50,6 +46,7 @@ namespace wayland {
     }
 
     any_sender_of<> send(std::span<std::byte> buffer);
+
     any_sequence_of<std::span<std::byte>> subscribe();
 
     any_sender_of<> receive_all();
