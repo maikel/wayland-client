@@ -22,6 +22,10 @@
 #include <sio/io_uring/socket_handle.hpp>
 #include <sio/local/stream_protocol.hpp>
 #include <sio/intrusive_list.hpp>
+#include <sio/sequence/iterate.hpp>
+#include <sio/sequence/then_each.hpp>
+#include <sio/sequence/let_value_each.hpp>
+#include <sio/sequence/ignore_all.hpp>
 #include <sio/tap.hpp>
 
 #include <exec/async_scope.hpp>
@@ -34,17 +38,77 @@
 namespace wayland {
   using namespace sio;
 
+  struct buffer_sentinel { };
+
+  message_header extract_header(std::span<std::byte> bytes) {
+    message_header header{};
+    if (bytes.size() >= sizeof(message_header)) {
+      std::memcpy(&header, bytes.data(), sizeof(message_header));
+    }
+    return header;
+  }
+
+  struct buffer_iterator {
+    std::span<std::byte> range_;
+    std::ptrdiff_t position_;
+
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = std::span<std::byte>;
+    using difference_type = std::ptrdiff_t;
+
+    explicit buffer_iterator(std::span<std::byte> range, std::ptrdiff_t position = 0)
+      : range_(range)
+      , position_(position) {
+    }
+
+    buffer_iterator& operator++() noexcept {
+      message_header header = extract_header(range_.subspan(position_));
+      position_ += header.message_length;
+      return *this;
+    }
+
+    buffer_iterator operator++(int) noexcept {
+      buffer_iterator tmp = *this;
+      ++*this;
+      return tmp;
+    }
+
+    std::span<std::byte> operator*() const noexcept {
+      message_header header = extract_header(range_.subspan(position_));
+      return range_.subspan(position_, header.message_length);
+    }
+
+    bool operator==(const buffer_sentinel&) const noexcept {
+      return range_.size() < position_ + sizeof(message_header);
+    }
+
+    bool operator!=(const buffer_sentinel&) const noexcept {
+      return !(*this == buffer_sentinel{});
+    }
+  };
+
+  bool operator==(const buffer_sentinel&, const buffer_iterator& iter) noexcept {
+    return iter == buffer_sentinel{};
+  }
+
+  bool operator!=(const buffer_sentinel&, const buffer_iterator& iter) noexcept {
+    return !(iter == buffer_sentinel{});
+  }
+
+  static_assert(std::input_iterator<buffer_iterator>);
+  static_assert(std::sentinel_for<buffer_sentinel, buffer_iterator>);
+
   struct receiver_base {
-    receiver_base* next_;
-    receiver_base* prev_;
     any_sequence_receiver<std::span<std::byte>> receiver_;
+    receiver_base* next_{};
+    receiver_base* prev_{};
   };
 
   using socket_type = io_uring::socket<local::stream_protocol>;
   using socket_handle = io_uring::socket_handle<local::stream_protocol>;
 
-  struct connection::impl {
-    explicit impl(exec::io_uring_context& context)
+  struct connection_context {
+    explicit connection_context(exec::io_uring_context& context)
       : buffer_{}
       , socket_{context, local::stream_protocol()}
       , receivers_{}
@@ -55,6 +119,10 @@ namespace wayland {
     socket_type socket_;
     intrusive_list<&receiver_base::next_, &receiver_base::prev_> receivers_;
     exec::async_scope scope_;
+  };
+
+  struct connection::impl : connection_context {
+    using connection_context::connection_context;
   };
 
   connection::~connection() = default;
@@ -183,44 +251,63 @@ namespace wayland {
       processed,
     };
 
-    process_result process_buffer(std::span<std::byte>* buffer) {
-      if (buffer->empty()) {
-        return disconnected;
-      }
-      while (buffer->size() >= sizeof(message_header)) {
-        message_header header{};
-        std::memcpy(&header, buffer->data(), sizeof(message_header));
-        if (buffer->size() < header.message_length) {
-          return need_more;
-        }
-        log("connection", "Received message to Object ID: {}, Message length: {}, Opcode: {}",
-            header.object_id,
-            header.message_length,
-            header.opcode);
-        std::span<std::byte> message = buffer->subspan(0, header.message_length);
-        log_recv_buffer(message);
-        std::span<std::byte> rest = buffer->subspan(header.message_length);
-        std::memmove(buffer->data(), rest.data(), rest.size());
-        *buffer = buffer->subspan(0, rest.size());
-      }
-      return need_more;
+    auto notify_all_listeners(
+      exec::async_scope& scope,
+      intrusive_list<&receiver_base::next_, &receiver_base::prev_>& listeners,
+      std::span<std::byte> message) {
+      return sio::iterate(listeners) //
+           | sio::then_each([&scope, message](receiver_base& listener) {
+               scope.spawn(exec::set_next(listener.receiver_, stdexec::just(message)));
+             }) //
+           | sio::ignore_all();
     }
 
-    auto receive_all_messages_until_disconnect(socket_handle socket, std::span<std::byte> buffer) {
-      return stdexec::just(socket, buffer, std::span<std::byte>{}) //
+    auto process_buffer(
+      exec::async_scope& scope,
+      intrusive_list<&receiver_base::next_, &receiver_base::prev_>& listeners,
+      std::span<std::byte> buffer) {
+      return sio::reduce(
+        sio::iterate(std::ranges::subrange(buffer_iterator{buffer}, buffer_sentinel{})) //
+          | sio::let_value_each([&](std::span<std::byte> message) {
+              message_header header{};
+              std::memcpy(&header, message.data(), sizeof(message_header));
+              log(
+                "connection",
+                "Received message to Object ID: {}, Message length: {}, Opcode: {}",
+                header.object_id,
+                header.message_length,
+                header.opcode);
+              log_recv_buffer(message);
+              return sio::tap(
+                notify_all_listeners(scope, listeners, message),
+                stdexec::just(header.message_length));
+            }),
+        0);
+    }
+
+    auto receive_all_messages_until_disconnect(connection_context& context) {
+      return stdexec::just(get_handle(context.socket_), context.buffer_, std::span<std::byte>{}) //
            | stdexec::let_value(
-               [](socket_handle socket, std::span<std::byte> buffer, std::span<std::byte>& filled) {
+               [&context](
+                 socket_handle socket, std::span<std::byte> buffer, std::span<std::byte>& filled) {
                  return sio::async::read_some(socket, buffer.subspan(filled.size())) //
-                      | stdexec::then([&filled, buffer](int n) -> std::span<std::byte>* {
-                          if (n == 0) {
-                            filled = std::span<std::byte>{};
-                          } else {
-                            filled = buffer.subspan(0, filled.size() + n);
-                          }
-                          return &filled;
-                        })                             //
-                      | stdexec::then(&process_buffer) //
-                      | stdexec::then([](process_result res) { return res == disconnected; })
+                      | stdexec::let_value([&context, &filled, buffer](int n) {
+                          filled = buffer.subspan(0, filled.size() + n);
+                          return if_then_else(
+                            n == 0,
+                            stdexec::just() | stdexec::then([] {
+                              log("connection", "Disconnected from Wayland server.");
+                              return 0;
+                            }),
+                            process_buffer(context.scope_, context.receivers_, filled));
+                        }) //
+                      | stdexec::then([&](int n) {
+                          auto consumed = filled.subspan(0, n);
+                          auto rest = filled.subspan(n);
+                          std::memmove(filled.data(), rest.data(), rest.size());
+                          filled = filled.subspan(0, rest.size());
+                          return n == 0;
+                        })
                       | exec::repeat_effect_until();
                });
     }
@@ -246,13 +333,84 @@ namespace wayland {
          | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
   }
 
-  any_sequence_of<std::span<std::byte>> connection_handle::receive() {
-    return exec::empty_sequence();
+  template <class Receiver>
+  struct subscribe_operation;
+
+  template <class Receiver>
+  struct subscribe_receiver {
+    using is_receiver = void;
+    subscribe_operation<Receiver>* op_;
+
+    stdexec::env_of_t<Receiver> get_env(stdexec::get_env_t) const noexcept {
+      return stdexec::get_env(op_->rcvr_);
+    }
+
+    template <class Item>
+    exec::next_sender_of_t<Receiver, Item> set_next(exec::set_next_t, Item&& item) {
+      return exec::set_next(op_->rcvr_, std::forward<Item>(item));
+    }
+
+    void set_value(stdexec::set_value_t) && noexcept {
+      op_->subscriptions_->erase(&op_->this_subscription_);
+      stdexec::set_value(std::move(op_->rcvr_));
+    }
+
+    void set_stopped(stdexec::set_stopped_t) && noexcept {
+      op_->subscriptions_->erase(&op_->this_subscription_);
+      stdexec::set_stopped(std::move(op_->rcvr_));
+    }
+
+    void set_error(stdexec::set_error_t, std::exception_ptr e) && noexcept {
+      op_->subscriptions_->erase(&op_->this_subscription_);
+      stdexec::set_error(std::move(op_->rcvr_), std::move(e));
+    }
+
+    void set_error(stdexec::set_error_t, std::error_code e) && noexcept {
+      op_->subscriptions_->erase(&op_->this_subscription_);
+      stdexec::set_error(std::move(op_->rcvr_), std::move(e));
+    }
+  };
+
+  template <class Receiver>
+  struct subscribe_operation {
+    Receiver rcvr_;
+    subscribe_receiver<Receiver> sub_rcvr_;
+    intrusive_list<&receiver_base::next_, &receiver_base::prev_>* subscriptions_;
+    receiver_base this_subscription_;
+
+    subscribe_operation(
+      Receiver rcvr,
+      intrusive_list<&receiver_base::next_, &receiver_base::prev_>* subscriptions)
+      : rcvr_(std::move(rcvr))
+      , sub_rcvr_{this}
+      , subscriptions_(subscriptions)
+      , this_subscription_{sub_rcvr_} {
+    }
+
+    void start(stdexec::start_t) noexcept {
+      subscriptions_->push_back(&this_subscription_);
+    }
+  };
+
+  struct subscribe_to_wayland {
+    using is_sender = exec::sequence_tag;
+    intrusive_list<&receiver_base::next_, &receiver_base::prev_>* subscriptions_;
+
+    using completion_signatures =
+      stdexec::completion_signatures_of_t<any_sequence_of<std::span<std::byte>>, stdexec::empty_env>;
+
+    template <class Receiver>
+    subscribe_operation<Receiver> subscribe(exec::subscribe_t, Receiver rcvr) const {
+      return {std::move(rcvr), subscriptions_};
+    }
+  };
+
+  any_sequence_of<std::span<std::byte>> connection_handle::subscribe() {
+    return subscribe_to_wayland{&connection_->impl_->receivers_};
   }
 
   any_sender_of<> connection_handle::receive_all() {
-    return receive_all_messages_until_disconnect(
-      get_handle(connection_->impl_->socket_), connection_->impl_->buffer_);
+    return receive_all_messages_until_disconnect(*connection_->impl_);
   }
 
 } // namespace wayland
