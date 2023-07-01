@@ -15,6 +15,7 @@
  */
 #include "./any_sender_of.hpp"
 #include "./connection.hpp"
+#include "./protocol.hpp"
 #include "./logging.hpp"
 #include "./message_header.hpp"
 
@@ -38,22 +39,20 @@ int main() {
   using namespace wayland;
   exec::io_uring_context context{};
 
-  get_registry msg = {
-    .header =
-      {
-               .object_id = 1,
-               .opcode = 1,
-               .message_length = sizeof(get_registry),
-               },
-    .name = 2,
-  };
-
   connection conn{context};
   auto using_connection =
-    sio::zip(sio::async::run(conn), stdexec::just(msg)) //
-    | sio::let_value_each([](connection_handle h, get_registry& msg) {
-        return stdexec::when_all(h.send(msg), h.receive_all());
-      }) //
+    sio::async::run(conn) //
+    | sio::let_value_each([](connection_handle h) {
+        wayland::display display(h);
+        // return stdexec::let_value(display.get_registry(2), [](registry r) {
+        //   return r.on_global() //
+        //        | stdexec::then_each([](name which, std::string_view interface, version ver) {
+        //            log("global: {}" interface);
+        //          }) //
+        //        | sio::ignore_all();
+        // });
+        return stdexec::just();
+      })
     | sio::ignore_all();
 
   run_on(context, std::move(using_connection));

@@ -48,8 +48,6 @@ namespace wayland {
     any_sender_of<> send(std::span<std::byte> buffer);
 
     any_sequence_of<std::span<std::byte>> subscribe();
-
-    any_sender_of<> receive_all();
   };
 
   class connection {

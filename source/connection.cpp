@@ -78,6 +78,7 @@ namespace wayland {
       message_header header = extract_header(range_.subspan(position_));
       return range_.subspan(position_, header.message_length);
     }
+
     bool operator==(const buffer_sentinel&) const noexcept {
       return range_.size() < position_ + sizeof(message_header);
     }
@@ -118,45 +119,12 @@ namespace wayland {
     alignas(4096) std::array<std::byte, 8192> buffer_;
     socket_type socket_;
     intrusive_list<&receiver_base::next_, &receiver_base::prev_> receivers_;
+    stdexec::in_place_stop_source stop_source_;
     exec::async_scope scope_;
+    int ref_counter_{0};
+    void* complete_close_data_{nullptr};
+    void (*complete_close_)(void*) noexcept = nullptr;
   };
-
-  struct connection::impl : connection_context {
-    using connection_context::connection_context;
-  };
-
-  connection::~connection() = default;
-
-  connection::connection(exec::io_uring_context& context)
-    : impl_(std::make_unique<impl>(context)) {
-  }
-
-  any_sender_of<connection_handle> connection::open(async::open_t) {
-    auto iter = std::ranges::begin(impl_->receivers_);
-    return async::open(impl_->socket_) //
-         | stdexec::let_value([this](socket_handle sock) {
-             const char* xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR");
-             if (!xdg_runtime_dir) {
-               throw std::runtime_error("XDG_RUNTIME_DIR not set");
-             }
-             const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
-             if (!wayland_display) {
-               throw std::runtime_error("WAYLAND_DISPLAY not set");
-             }
-             const std::filesystem::path path =
-               std::filesystem::path(xdg_runtime_dir) / wayland_display;
-             if (!std::filesystem::exists(path)) {
-               throw std::runtime_error("Wayland socket does not exist");
-             }
-             log("connection", "Connecting to the Wayland server socket '{}'...", path.c_str());
-             return sio::tap(
-               sio::async::connect(sock, local::endpoint(path.c_str())),
-               stdexec::just() | stdexec::then([this] {
-                 log("connection", "Connected to the Wayland server.");
-                 return connection_handle{*this};
-               }));
-           });
-  }
 
   namespace {
     template <class ThenSender, class ElseSender>
@@ -286,10 +254,11 @@ namespace wayland {
     }
 
     auto receive_all_messages_until_disconnect(connection_context& context) {
-      return stdexec::just(get_handle(context.socket_), context.buffer_, std::span<std::byte>{}) //
+      return stdexec::just(std::span<std::byte>{}) //
            | stdexec::let_value(
-               [&context](
-                 socket_handle socket, std::span<std::byte> buffer, std::span<std::byte>& filled) {
+               [&context](std::span<std::byte>& filled) {
+                 auto socket = get_handle(context.socket_);
+                 std::span buffer{context.buffer_};
                  return sio::async::read_some(socket, buffer.subspan(filled.size())) //
                       | stdexec::let_value([&context, &filled, buffer](int n) {
                           filled = buffer.subspan(0, filled.size() + n);
@@ -298,7 +267,7 @@ namespace wayland {
                               n == 0,
                               stdexec::just() | stdexec::then([] {
                                 log("connection", "Disconnected from Wayland server.");
-                                return 0;
+                                return -1;
                               }),
                               process_buffer(context.scope_, context.receivers_, filled)),
                             context.scope_.on_empty());
@@ -308,31 +277,11 @@ namespace wayland {
                           auto rest = filled.subspan(n);
                           std::memmove(filled.data(), rest.data(), rest.size());
                           filled = filled.subspan(0, rest.size());
-                          return n == 0;
+                          return n < 0;
                         })
                       | exec::repeat_effect_until();
                });
     }
-  }
-
-  any_sender_of<> connection_handle::close(async::close_t) const {
-    return async::close(get_handle(connection_->impl_->socket_));
-  }
-
-  any_sender_of<> connection_handle::send(std::span<std::byte> buffer) {
-    if (buffer.size() < sizeof(message_header)) {
-      throw std::runtime_error("Buffer too small");
-    }
-    message_header header{};
-    std::memcpy(&header, buffer.data(), sizeof(message_header));
-    log(
-      "connection",
-      "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
-      header.object_id,
-      header.message_length,
-      header.opcode);
-    return async::write(get_handle(connection_->impl_->socket_), buffer) //
-         | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
   }
 
   template <class Receiver>
@@ -407,12 +356,155 @@ namespace wayland {
     }
   };
 
-  any_sequence_of<std::span<std::byte>> connection_handle::subscribe() {
-    return subscribe_to_wayland{&connection_->impl_->receivers_};
+  struct receive_all_receiver {
+    using is_receiver = void;
+
+    connection_context* context_;
+
+    auto get_env(stdexec::get_env_t) const noexcept {
+      return exec::make_env(
+        exec::with(stdexec::get_stop_token, context_->stop_source_.get_token()));
+    }
+
+    void set_value(stdexec::set_value_t) && noexcept {
+      context_->ref_counter_ -= 1;
+      if (context_->ref_counter_ == 0 && context_->complete_close_) {
+        (*context_->complete_close_)(context_->complete_close_data_);
+      }
+    }
+
+    void set_stopped(stdexec::set_stopped_t) && noexcept {
+      context_->ref_counter_ -= 1;
+      if (context_->ref_counter_ == 0 && context_->complete_close_) {
+        (*context_->complete_close_)(context_->complete_close_data_);
+      }
+    }
+
+    void set_error(stdexec::set_error_t, std::error_code err) && noexcept {
+      log("connection", "Error Code ({}): {}", err.value(), err.message());
+      context_->ref_counter_ -= 1;
+      if (context_->ref_counter_ == 0 && context_->complete_close_) {
+        (*context_->complete_close_)(context_->complete_close_data_);
+      }
+    }
+
+    void set_error(stdexec::set_error_t, std::exception_ptr err) && noexcept {
+      try { 
+        std::rethrow_exception(err);
+      } catch (std::exception& e) {
+        log("connection", "Error: {}", e.what());
+      }
+      context_->ref_counter_ -= 1;
+      if (context_->ref_counter_ == 0 && context_->complete_close_) {
+        (*context_->complete_close_)(context_->complete_close_data_);
+      }
+    }
+  };
+
+  struct connection::impl : connection_context {
+    using receive_all_sender =
+      decltype(receive_all_messages_until_disconnect(std::declval<connection_context&>()));
+
+    impl(exec::io_uring_context& ctx)
+      : connection_context{ctx}
+      , receive_all_(stdexec::connect(
+          receive_all_messages_until_disconnect(*this),
+          receive_all_receiver{this})) {
+    }
+
+    stdexec::connect_result_t<receive_all_sender, receive_all_receiver> receive_all_;
+  };
+
+  connection::~connection() = default;
+
+  connection::connection(exec::io_uring_context& context)
+    : impl_(std::make_unique<impl>(context)) {
   }
 
-  any_sender_of<> connection_handle::receive_all() {
-    return receive_all_messages_until_disconnect(*connection_->impl_);
+  any_sender_of<connection_handle> connection::open(async::open_t) {
+    auto iter = std::ranges::begin(impl_->receivers_);
+    return async::open(impl_->socket_) //
+         | stdexec::let_value([this](socket_handle sock) {
+             const char* xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+             if (!xdg_runtime_dir) {
+               throw std::runtime_error("XDG_RUNTIME_DIR not set");
+             }
+             const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
+             if (!wayland_display) {
+               throw std::runtime_error("WAYLAND_DISPLAY not set");
+             }
+             const std::filesystem::path path =
+               std::filesystem::path(xdg_runtime_dir) / wayland_display;
+             if (!std::filesystem::exists(path)) {
+               throw std::runtime_error("Wayland socket does not exist");
+             }
+             log("connection", "Connecting to the Wayland server socket '{}'...", path.c_str());
+             return sio::tap(
+               sio::async::connect(sock, local::endpoint(path.c_str())),
+               stdexec::just() | stdexec::then([this] {
+                 log("connection", "Connected to the Wayland server.");
+                 this->impl_->ref_counter_ += 1;
+                 stdexec::start(this->impl_->receive_all_);
+                 return connection_handle{*this};
+               }));
+           });
+  }
+
+  template <class Receiver>
+  struct close_operation {
+    Receiver rcvr_;
+    connection_context* context_;
+
+    void start(stdexec::start_t) noexcept {
+      if (context_->ref_counter_ == 0) {
+        stdexec::set_value(std::move(rcvr_));
+      } else {
+        context_->complete_close_data_ = this;
+        context_->complete_close_ = [](void* ptr) noexcept {
+          auto self = static_cast<close_operation*>(ptr);
+          stdexec::set_value(std::move(self->rcvr_));
+        };
+      }
+    }
+  };
+
+  struct close_sender {
+    using is_sender = void;
+
+    connection_context* context_;
+
+    using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t()>;
+
+    template <class Receiver>
+    close_operation<Receiver> connect(stdexec::connect_t, Receiver rcvr) const {
+      return {std::move(rcvr), context_};
+    }
+  };
+
+  any_sender_of<> connection_handle::close(async::close_t) const {
+    return sio::tap(
+      close_sender{connection_->impl_.get()},
+      async::close(get_handle(connection_->impl_->socket_)));
+  }
+
+  any_sender_of<> connection_handle::send(std::span<std::byte> buffer) {
+    if (buffer.size() < sizeof(message_header)) {
+      throw std::runtime_error("Buffer too small");
+    }
+    message_header header{};
+    std::memcpy(&header, buffer.data(), sizeof(message_header));
+    log(
+      "connection",
+      "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
+      header.object_id,
+      header.message_length,
+      header.opcode);
+    return async::write(get_handle(connection_->impl_->socket_), buffer) //
+         | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+  }
+
+  any_sequence_of<std::span<std::byte>> connection_handle::subscribe() {
+    return subscribe_to_wayland{&connection_->impl_->receivers_};
   }
 
 } // namespace wayland

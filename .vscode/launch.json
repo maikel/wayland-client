@@ -8,7 +8,7 @@
       "name": "(gdb) Launch",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceRoot}/build/ChatServer",
+      "program": "${workspaceRoot}/build/wayland-client",
       "args": [],
       "stopAtEntry": true,
       "cwd": "${workspaceRoot}/build",
