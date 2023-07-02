@@ -39,19 +39,18 @@ int main() {
   using namespace wayland;
   exec::io_uring_context context{};
 
+  get_registry get_reg{.header = {.object_id = 1, .opcode = 1, .message_length = sizeof(get_registry)}, .name = 2};
+
   connection conn{context};
   auto using_connection =
     sio::async::run(conn) //
-    | sio::let_value_each([](connection_handle h) {
-        wayland::display display(h);
-        // return stdexec::let_value(display.get_registry(2), [](registry r) {
-        //   return r.on_global() //
-        //        | stdexec::then_each([](name which, std::string_view interface, version ver) {
-        //            log("global: {}" interface);
-        //          }) //
-        //        | sio::ignore_all();
-        // });
-        return stdexec::just();
+    | sio::let_value_each([&](connection_handle h) {
+        auto display = sio::make_deferred<wayland::display>(h);
+        return sio::async::use_resources([](wayland::display display) {
+          return display.get_registry(id{2}) | stdexec::then([](wayland::registry registry) {
+
+          });
+        }, display);
       })
     | sio::ignore_all();
 

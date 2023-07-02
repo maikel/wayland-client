@@ -255,32 +255,31 @@ namespace wayland {
 
     auto receive_all_messages_until_disconnect(connection_context& context) {
       return stdexec::just(std::span<std::byte>{}) //
-           | stdexec::let_value(
-               [&context](std::span<std::byte>& filled) {
-                 auto socket = get_handle(context.socket_);
-                 std::span buffer{context.buffer_};
-                 return sio::async::read_some(socket, buffer.subspan(filled.size())) //
-                      | stdexec::let_value([&context, &filled, buffer](int n) {
-                          filled = buffer.subspan(0, filled.size() + n);
-                          return exec::finally(
-                            if_then_else(
-                              n == 0,
-                              stdexec::just() | stdexec::then([] {
-                                log("connection", "Disconnected from Wayland server.");
-                                return -1;
-                              }),
-                              process_buffer(context.scope_, context.receivers_, filled)),
-                            context.scope_.on_empty());
-                        }) //
-                      | stdexec::then([&](int n) {
-                          auto consumed = filled.subspan(0, n);
-                          auto rest = filled.subspan(n);
-                          std::memmove(filled.data(), rest.data(), rest.size());
-                          filled = filled.subspan(0, rest.size());
-                          return n < 0;
-                        })
-                      | exec::repeat_effect_until();
-               });
+           | stdexec::let_value([&context](std::span<std::byte>& filled) {
+               auto socket = get_handle(context.socket_);
+               std::span buffer{context.buffer_};
+               return sio::async::read_some(socket, buffer.subspan(filled.size())) //
+                    | stdexec::let_value([&context, &filled, buffer](int n) {
+                        filled = buffer.subspan(0, filled.size() + n);
+                        return exec::finally(
+                          if_then_else(
+                            n == 0,
+                            stdexec::just() | stdexec::then([] {
+                              log("connection", "Disconnected from Wayland server.");
+                              return -1;
+                            }),
+                            process_buffer(context.scope_, context.receivers_, filled)),
+                          context.scope_.on_empty());
+                      }) //
+                    | stdexec::then([&](int n) {
+                        auto consumed = filled.subspan(0, n);
+                        auto rest = filled.subspan(n);
+                        std::memmove(filled.data(), rest.data(), rest.size());
+                        filled = filled.subspan(0, rest.size());
+                        return n < 0;
+                      })
+                    | exec::repeat_effect_until();
+             });
     }
   }
 
@@ -323,11 +322,23 @@ namespace wayland {
   };
 
   template <class Receiver>
+  struct on_stop_operation {
+    subscribe_receiver<Receiver>* sub_rcvr_;
+
+    void operator()() const noexcept {
+      stdexec::set_value(std::move(*sub_rcvr_));
+    }
+  };
+
+  template <class Receiver>
   struct subscribe_operation {
     Receiver rcvr_;
     subscribe_receiver<Receiver> sub_rcvr_;
     intrusive_list<&receiver_base::next_, &receiver_base::prev_>* subscriptions_;
     receiver_base this_subscription_;
+    using on_stop = typename stdexec::stop_token_of_t<
+      stdexec::env_of_t<Receiver>>::template callback_type<on_stop_operation<Receiver>>;
+    on_stop on_stop_;
 
     subscribe_operation(
       Receiver rcvr,
@@ -335,7 +346,8 @@ namespace wayland {
       : rcvr_(std::move(rcvr))
       , sub_rcvr_{this}
       , subscriptions_(subscriptions)
-      , this_subscription_{sub_rcvr_} {
+      , this_subscription_{sub_rcvr_}
+      , on_stop_(stdexec::get_stop_token(stdexec::get_env(rcvr_)), &sub_rcvr_) {
     }
 
     void start(stdexec::start_t) noexcept {
@@ -389,7 +401,7 @@ namespace wayland {
     }
 
     void set_error(stdexec::set_error_t, std::exception_ptr err) && noexcept {
-      try { 
+      try {
         std::rethrow_exception(err);
       } catch (std::exception& e) {
         log("connection", "Error: {}", e.what());
@@ -457,13 +469,16 @@ namespace wayland {
 
     void start(stdexec::start_t) noexcept {
       if (context_->ref_counter_ == 0) {
+        log("connection", "Connection closed.");
         stdexec::set_value(std::move(rcvr_));
       } else {
         context_->complete_close_data_ = this;
         context_->complete_close_ = [](void* ptr) noexcept {
+          log("connection", "Connection closed.");
           auto self = static_cast<close_operation*>(ptr);
           stdexec::set_value(std::move(self->rcvr_));
         };
+        // context_->stop_source_.request_stop();
       }
     }
   };

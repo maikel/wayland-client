@@ -8,14 +8,18 @@
 namespace wayland {
   struct object;
 
-  using event_handler = void (*)(object*, std::span<std::byte>) noexcept;
+  using event_handler = void (*)(object*, message_header, std::span<std::byte>) noexcept;
 
-  enum class name : uint32_t {};
-  enum class id : uint32_t {};
-  enum class version : uint32_t {};
+  enum class name : uint32_t {
+  };
+  enum class id : uint32_t {
+  };
+  enum class version : uint32_t {
+  };
 
   struct object {
     std::span<event_handler> events_;
+    void (*destroyed_)(object*) noexcept;
     id id_;
   };
 
@@ -23,7 +27,8 @@ namespace wayland {
 
   class registry {
    public:
-    ~registry();
+    registry() = default;
+    ~registry() {}
 
     any_sequence_of<name, std::string_view, id> on_global();
     any_sequence_of<name> on_global_removal();
@@ -41,15 +46,21 @@ namespace wayland {
     friend class display;
 
     struct impl;
-    impl* impl_;
+    impl* impl_{nullptr};
   };
 
   class display : public object {
    public:
-    explicit display(connection_handle connection);
-    ~display();
+    any_sender_of<registry> get_registry(id new_id);
 
-    any_sender_of<registry> get_registry(uint32_t id);
+    explicit display(connection_handle connection, id new_id = id{1});
+
+   private:
+    friend class sio::async::close_t;
+    any_sender_of<> close(sio::async::close_t) const;
+
+    friend class sio::async::open_t;
+    any_sender_of<display> open(sio::async::open_t);
 
    private:
     struct impl;
