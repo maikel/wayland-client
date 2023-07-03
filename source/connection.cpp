@@ -242,7 +242,7 @@ namespace wayland {
               log(
                 "connection",
                 "Received message to Object ID: {}, Message length: {}, Opcode: {}",
-                header.object_id,
+                static_cast<int>(header.object_id),
                 header.message_length,
                 header.opcode);
               log_recv_buffer(message);
@@ -507,16 +507,18 @@ namespace wayland {
     if (buffer.size() < sizeof(message_header)) {
       throw std::runtime_error("Buffer too small");
     }
-    message_header header{};
-    std::memcpy(&header, buffer.data(), sizeof(message_header));
-    log(
-      "connection",
-      "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
-      header.object_id,
-      header.message_length,
-      header.opcode);
-    return async::write(get_handle(connection_->impl_->socket_), buffer) //
-         | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+    return stdexec::let_value(stdexec::just(buffer), [this](std::span<std::byte> buffer) {
+      message_header header{};
+      std::memcpy(&header, buffer.data(), sizeof(message_header));
+      log(
+        "connection",
+        "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
+        static_cast<int>(header.object_id),
+        header.message_length,
+        header.opcode);
+      return async::write(get_handle(connection_->impl_->socket_), buffer) //
+           | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+    });
   }
 
   any_sequence_of<std::span<std::byte>> connection_handle::subscribe() {

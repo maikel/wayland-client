@@ -5,8 +5,15 @@
 
 namespace wayland {
 
+  enum class name : uint32_t {
+  };
+  enum class id : uint32_t {
+  };
+  enum class version : uint32_t {
+  };
+
   struct message_header {
-    uint32_t object_id;
+    id object_id;
     uint16_t opcode;
     uint16_t message_length;
   };

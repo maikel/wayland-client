@@ -10,13 +10,6 @@ namespace wayland {
 
   using event_handler = void (*)(object*, message_header, std::span<std::byte>) noexcept;
 
-  enum class name : uint32_t {
-  };
-  enum class id : uint32_t {
-  };
-  enum class version : uint32_t {
-  };
-
   struct object {
     std::span<event_handler> events_;
     id id_{};
@@ -38,11 +31,13 @@ namespace wayland {
     const wayland::object& object() const noexcept;
 
    private:
-    any_sender_of<wayland::object> bind(name which, std::span<event_handler> vtable);
+    any_sender_of<wayland::object, display*> bind(name which, std::span<event_handler> vtable);
+    
+    struct impl;
 
     friend class display;
+    explicit registry(impl& impl);
 
-    struct impl;
     impl* impl_{nullptr};
   };
 
