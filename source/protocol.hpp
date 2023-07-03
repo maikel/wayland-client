@@ -19,29 +19,26 @@ namespace wayland {
 
   struct object {
     std::span<event_handler> events_;
-    void (*destroyed_)(object*) noexcept;
-    id id_;
+    id id_{};
+    void (*destroyed_)(object*) noexcept{nullptr};
   };
 
   class display;
 
   class registry {
    public:
-    registry() = default;
-    ~registry() {}
-
     any_sequence_of<name, std::string_view, id> on_global();
     any_sequence_of<name> on_global_removal();
 
     template <class Tp>
-    any_sender_of<Tp> bind(name which, id new_id) {
-      return bind(which, new_id, Tp::get_vtable()) | construct<Tp>();
+    any_sender_of<Tp> bind(name which) {
+      return bind(which, Tp::get_vtable()) | construct<Tp>();
     }
 
     const wayland::object& object() const noexcept;
 
    private:
-    any_sender_of<wayland::object> bind(name which, id new_id, std::span<event_handler> vtable);
+    any_sender_of<wayland::object> bind(name which, std::span<event_handler> vtable);
 
     friend class display;
 
@@ -51,9 +48,9 @@ namespace wayland {
 
   class display : public object {
    public:
-    any_sender_of<registry> get_registry(id new_id);
+    any_sender_of<registry> get_registry();
 
-    explicit display(connection_handle connection, id new_id = id{1});
+    explicit display(connection_handle connection);
 
    private:
     friend class sio::async::close_t;

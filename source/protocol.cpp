@@ -47,7 +47,7 @@ namespace wayland {
       }
 
       void set_value(stdexec::set_value_t) const noexcept {
-        log("display", "dispatch_receiver::set_value");
+        log("display", "Message dispatching is completed.");
       }
 
       void set_error(stdexec::set_error_t, std::error_code) const noexcept {
@@ -92,6 +92,107 @@ namespace wayland {
         dispatch_receiver{stop_token});
     }
 
+    struct display_;
+
+    template <class Receiver>
+    struct callback_base : object {
+
+      callback_base(Receiver rcvr, wayland::display_* display, std::span<event_handler> vtable) noexcept
+        : object{vtable}
+        , receiver_(std::move(rcvr))
+        , display_(display) {}
+
+      Receiver receiver_;
+      wayland::display_* display_;
+      int op_counter_{0};
+    };
+
+    template <class Receiver>
+    struct callback_receiver {
+      using is_receiver = void;
+      using __id = callback_receiver;
+      using __t = callback_receiver;
+
+      callback_base<Receiver>* op_;
+
+      stdexec::env_of_t<Receiver> get_env(stdexec::get_env_t) const noexcept {
+        return stdexec::get_env(op_->receiver_);
+      }
+
+      void unregister_callback() const noexcept;
+
+      void set_value(stdexec::set_value_t) const noexcept {
+        log("callback", "Sent message");
+      }
+
+      void set_error(stdexec::set_error_t, std::error_code ec) const noexcept {
+        log("callback", "Error sending message: {} (Error Code: {})", ec.message(), ec.value());
+        unregister_callback();
+        stdexec::set_error(std::move(op_->receiver_), std::move(ec));
+      }
+
+      void set_error(stdexec::set_error_t, std::exception_ptr ep) const noexcept {
+        try {
+          std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+          log("callback", "Error sending message: {}", e.what());
+        } catch (...) {
+          log("callback", "Error sending message: Unknown error type.");
+        }
+        unregister_callback();
+        stdexec::set_error(std::move(op_->receiver_), std::move(ep));
+      }
+
+      void set_stopped(stdexec::set_stopped_t) const noexcept {
+        log("callback", "Stopped sending message");
+        unregister_callback();
+        stdexec::set_stopped(std::move(op_->receiver_));
+      }
+    };
+
+    struct sync_message_t {
+      message_header header;
+      id new_id;
+    };
+
+    template <class Receiver>
+    struct callback : callback_base<Receiver> {
+      using send_operation_t = stdexec::connect_result_t<
+        decltype(std::declval<connection_handle&>().send(std::declval<sync_message_t&>())),
+        callback_receiver<Receiver>
+      >;
+      sync_message_t sync_message_;
+      send_operation_t send_operation_;
+
+      static void on_done(object* obj, message_header, std::span<std::byte>) noexcept;
+
+      static std::span<event_handler, 1> get_vtable() noexcept {
+        static std::array<event_handler, 1> vtable = {&on_done};
+        return vtable;
+      }
+
+      callback(Receiver rcvr, wayland::display_* display);
+
+      void start(stdexec::start_t) noexcept;
+    };
+    
+    struct callback_sender {
+      wayland::display_* display_;
+
+      using is_sender = void;
+
+      using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t(),
+        stdexec::set_error_t(std::error_code),
+        stdexec::set_error_t(std::exception_ptr),
+        stdexec::set_stopped_t()>;
+
+      template <class Receiver>
+      callback<Receiver> connect(stdexec::connect_t, Receiver rcvr) const noexcept {
+        return callback<Receiver>{std::move(rcvr), display_};
+      }
+    };
+
     struct display_ : object {
       static void on_error(object* obj, message_header, std::span<std::byte> buffer) noexcept {
         display_* self = static_cast<display_*>(obj);
@@ -122,7 +223,7 @@ namespace wayland {
       }
 
       explicit display_(connection_handle connection) noexcept
-        : object{get_vtable(), &on_destroyed_, id{1}}
+        : object{get_vtable(), id{1}, &on_destroyed_}
         , connection_(connection)
         , objects_{}
         , operation_{dispatch(connection.subscribe(), objects_, stop_source_.get_token())} {
@@ -130,8 +231,52 @@ namespace wayland {
         stdexec::start(operation_);
       }
 
+      void register_object(object& obj) noexcept {
+        uint32_t index = static_cast<uint32_t>(obj.id_);
+        if (index > objects_.size()) {
+          objects_.resize(2*index);
+        }
+        assert(index > 0);
+        index -= 1;
+        if (objects_[index]) {
+          log("display", "Object {} is already registered.", static_cast<int>(obj.id_));
+        } else {
+          objects_[index] = &obj;
+          log("display", "Registered object {}.", static_cast<int>(obj.id_));
+        }
+      }
+
+      void unregister_object(object& obj) noexcept {
+        uint32_t index = static_cast<uint32_t>(obj.id_);
+        assert(index > 0);
+        assert (index <= objects_.size());
+        index -= 1;
+        if (objects_[index] == &obj) {
+          objects_[index] = nullptr;
+          free_ids_.push_back(index + 1);
+          log("display", "Unregistered object {}.", static_cast<int>(obj.id_));
+        } else {
+          log("display", "Object {} is not registered.", static_cast<int>(obj.id_));
+        }
+      }
+
+      id get_new_id() noexcept {
+        if (free_ids_.empty()) {
+          return static_cast<id>(objects_.size() + 1);
+        } else {
+          uint32_t index = free_ids_.back();
+          free_ids_.pop_back();
+          return id{index};
+        }
+      }
+
+      callback_sender sync() noexcept {
+        return callback_sender{this};
+      }
+
       connection_handle connection_;
       std::vector<object*> objects_;
+      std::vector<uint32_t> free_ids_;
       using operation_type = decltype(dispatch(
         std::declval<connection_handle&>().subscribe(),
         std::declval<std::vector<object*>&>(),
@@ -141,13 +286,49 @@ namespace wayland {
     };
   }
 
+  template <class Receiver>
+  callback<Receiver>::callback(Receiver rcvr, wayland::display_* display)
+      : callback_base<Receiver>{std::move(rcvr), display, get_vtable()}
+      , sync_message_{}
+      , send_operation_{stdexec::connect(
+          this->display_->connection_.send(sync_message_),
+          callback_receiver<Receiver>{this})}
+      {
+      }
+
+  template <class Receiver>
+  void callback<Receiver>::on_done(object* obj, message_header, std::span<std::byte>) noexcept {
+    callback* self = static_cast<callback*>(obj);
+    log("callback", "Received sync answer for callback id {}", static_cast<int>(self->id_));
+    self->display_->unregister_object(*self);
+    stdexec::set_value(std::move(self->receiver_));
+  }
+
+  template <class Receiver>
+  void callback_receiver<Receiver>::unregister_callback() const noexcept {
+    op_->display_->unregister_object(*op_);
+  }
+
+  template <class Receiver>
+  void callback<Receiver>::start(stdexec::start_t) noexcept {
+    this->id_ = this->display_->get_new_id();
+    sync_message_.header.object_id = static_cast<uint32_t>(this->display_->id_);
+    sync_message_.header.opcode = 0;
+    sync_message_.header.message_length = sizeof(sync_message_t);
+    sync_message_.new_id = this->id_;
+    log("callback", "Register as id {}.", static_cast<int>(this->id_));
+    this->display_->register_object(*this);
+    log("callback", "Sending sync message.");
+    stdexec::start(this->send_operation_);
+  }
+
   struct display::impl : display_ {
     explicit impl(connection_handle connection) noexcept
       : display_{connection} {
     }
   };
 
-  display::display(connection_handle connection, id new_id)
+  display::display(connection_handle connection)
     : impl_{std::bit_cast<impl*>(connection)} {
   }
 
@@ -173,41 +354,16 @@ namespace wayland {
     id new_id;
   };
 
-  struct sync_t {
-    message_header header;
-    uint32_t data;
-  };
-
-  struct synced_get_registry_t {
-    get_registry_t get_registry;
-    sync_t sync;
-  };
-
-  any_sender_of<registry> display::get_registry(id new_id) {
+  any_sender_of<registry> display::get_registry() {
     display_* self = this->impl_;
-    get_registry_t message{
-      .header =
-        {
-                 .object_id = 1,
-                 .opcode = 1,
-                 .message_length = sizeof(get_registry_t),
-                 },
-      .new_id = new_id
-    };
-    sync_t sync{
-      .header =
-        {
-                 .object_id = 1,
-                 .opcode = 0,
-                 .message_length = sizeof(sync),
-                 },
-      .data = static_cast<uint32_t>(new_id) + 1
-    };
-    return stdexec::let_value(
-      stdexec::just(self, message, sync), [](display_* self, auto& message, auto& sync) {
-        return stdexec::let_value(
-          stdexec::when_all(self->connection_.send(message), self->connection_.send(sync)),
-          [] { return construct<registry>(stdexec::just()); });
+    registry reg{};
+    get_registry_t message{};
+    auto sender = stdexec::let_value(
+      stdexec::just(self, reg, message), [](display_* self, registry reg, get_registry_t& message) {
+        return stdexec::then(
+          self->sync(),
+          [reg] { return reg; });
       });
+    return sender;
   }
 }

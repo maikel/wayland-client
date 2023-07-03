@@ -478,7 +478,8 @@ namespace wayland {
           auto self = static_cast<close_operation*>(ptr);
           stdexec::set_value(std::move(self->rcvr_));
         };
-        // context_->stop_source_.request_stop();
+        log("connection", "Closing connection...");
+        context_->stop_source_.request_stop();
       }
     }
   };

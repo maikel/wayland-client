@@ -30,27 +30,23 @@ void run_on(exec::io_uring_context& ctx, Sender&& sndr) {
     | stdexec::then([](auto&&...) noexcept {}));
 }
 
-struct get_registry {
-  wayland::message_header header;
-  uint32_t name;
-};
-
 int main() {
   using namespace wayland;
   exec::io_uring_context context{};
-
-  get_registry get_reg{.header = {.object_id = 1, .opcode = 1, .message_length = sizeof(get_registry)}, .name = 2};
 
   connection conn{context};
   auto using_connection =
     sio::async::run(conn) //
     | sio::let_value_each([&](connection_handle h) {
         auto display = sio::make_deferred<wayland::display>(h);
-        return sio::async::use_resources([](wayland::display display) {
-          return display.get_registry(id{2}) | stdexec::then([](wayland::registry registry) {
-
-          });
-        }, display);
+        return sio::async::use_resources(
+          [](wayland::display display) {
+            return display.get_registry() //
+                 | stdexec::then([](wayland::registry registry) {
+                     log("main", "got the registry.");
+                   });
+          },
+          display);
       })
     | sio::ignore_all();
 
