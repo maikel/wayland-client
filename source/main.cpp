@@ -18,6 +18,8 @@
 #include "./protocol.hpp"
 #include "./logging.hpp"
 #include "./message_header.hpp"
+#include "./renderer.hpp"
+#include "./mdspan.hpp"
 
 #include <sio/sequence/ignore_all.hpp>
 
@@ -30,25 +32,42 @@ void run_on(exec::io_uring_context& ctx, Sender&& sndr) {
     | stdexec::then([](auto&&...) noexcept {}));
 }
 
+namespace stdx = std::experimental;
+
+template <std::size_t... Is>
+constexpr auto make_dynamic_extents(std::index_sequence<Is...>)
+  -> stdx::extents<int, ((void)Is, std::dynamic_extent)...> {
+  return {};
+}
+
+template <std::size_t Rank>
+using dynamic_extents = decltype(make_dynamic_extents(std::make_index_sequence<Rank>{}));
+
 int main() {
   using namespace wayland;
-  exec::io_uring_context context{};
+  exec::io_uring_context io_context{};
 
-  connection conn{context};
-  auto using_connection =
-    sio::async::run(conn) //
-    | sio::let_value_each([&](connection_handle h) {
-        auto display = sio::make_deferred<wayland::display>(h);
-        return sio::async::use_resources(
-          [](wayland::display display) {
-            return display.get_registry() //
-                 | stdexec::then([](wayland::registry registry) {
-                     log("main", "got the registry.");
-                   });
-          },
-          display);
-      })
-    | sio::ignore_all();
+  wayland::render_context renderer{io_context};
+  run_on(io_context, sio::async::run(renderer) | sio::ignore_all());
 
-  run_on(context, std::move(using_connection));
+  // connection conn{context};
+  // auto using_connection =
+  //   sio::async::run(conn) //
+  //   | sio::let_value_each([&](connection_handle h) {
+  //       return sio::async::use_resources(
+  //         [](wayland::display display) {
+  //           return display.use_registry([](wayland::registry registry) {
+  //             return sio::async::use_resources(
+  //               [](wayland::compositor compositor, wayland::shm shm) {
+  //                 return stdexec::just();
+  //               },
+  //               registry.bind<wayland::compositor>(),
+  //               registry.bind<wayland::shm>());
+  //           });
+  //         },
+  //         sio::make_deferred<wayland::display>(h));
+  //     })
+  //   | sio::ignore_all();
+
+  // run_on(context, std::move(using_connection));
 }

@@ -45,7 +45,14 @@ namespace wayland {
       return send(buffer);
     }
 
+    template <class Tp>
+    any_sender_of<> send_with_fd(Tp& msg, int fd) {
+      std::span<std::byte> buffer(reinterpret_cast<std::byte*>(&msg), sizeof(Tp));
+      return send_with_fd(buffer, fd);
+    }
+
     any_sender_of<> send(std::span<std::byte> buffer);
+    any_sender_of<> send_with_fd(std::span<std::byte> buffer, int fd);
 
     any_sequence_of<std::span<std::byte>> subscribe();
   };

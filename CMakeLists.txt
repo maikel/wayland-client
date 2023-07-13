@@ -8,5 +8,6 @@ add_executable(wayland-client
   source/connection.cpp
   source/main.cpp
   source/logging.cpp
-  source/protocol.cpp)
+  source/protocol.cpp
+  source/renderer.cpp)
 target_link_libraries(wayland-client PRIVATE sio::sio fmt::fmt)

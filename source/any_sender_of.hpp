@@ -39,4 +39,7 @@ using any_sequence_receiver = sio::any_sequence_receiver_ref<stdexec::completion
 template <class... Ts>
 using any_sequence_of = typename any_sequence_receiver<Ts...>::template any_sender<>;
 
+template <class Tp>
+using any_resource = any_sequence_of<Tp>;
+
 }
