@@ -66,22 +66,33 @@ namespace wayland {
     void* impl_{nullptr};
   };
 
-  class display : public object {
+  class display;
+
+  class display_handle {
    public:
     any_sequence_of<registry> get_registry();
-
-    display() = default;
-    explicit display(connection_handle connection);
 
    private:
     friend class sio::async::close_t;
     any_sender_of<> close(sio::async::close_t) const;
 
-    friend class sio::async::open_t;
-    any_sender_of<display> open(sio::async::open_t);
+
+    friend class display;
+    explicit display_handle(void* resource) noexcept;
+    void* resource_;
+  };
+
+  class display {
+   public:
+    display() = default;
+    explicit display(connection_handle connection);
 
    private:
-    void* impl_{nullptr};
+    friend class sio::async::open_t;
+    any_sender_of<display_handle> open(sio::async::open_t);
+
+   private:
+    connection_handle connection_;
   };
 
   class surface {

@@ -19,6 +19,7 @@
 #include "./logging.hpp"
 #include "./message_header.hpp"
 
+#include <sio/async_channel.hpp>
 #include <sio/io_uring/socket_handle.hpp>
 #include <sio/local/stream_protocol.hpp>
 #include <sio/intrusive_list.hpp>

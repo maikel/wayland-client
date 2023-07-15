@@ -25,19 +25,17 @@
 #include <span>
 
 namespace wayland {
-  class connection;
+  struct connection_context;
 
   class connection_handle {
    private:
-    connection* connection_;
+    connection_context* connection_;
 
     friend struct sio::async::close_t;
     any_sender_of<> close(sio::async::close_t) const;
 
    public:
-    explicit connection_handle(connection& connection) noexcept
-      : connection_(&connection) {
-    }
+    explicit connection_handle(connection_context& connection);
 
     template <class Tp>
     any_sender_of<> send(Tp& msg) {
@@ -60,12 +58,9 @@ namespace wayland {
   class connection {
    public:
     explicit connection(exec::io_uring_context& context);
-    ~connection();
 
    private:
-    friend class connection_handle;
-    struct impl;
-    std::unique_ptr<impl> impl_;
+    exec::io_uring_context* context_;
 
     friend struct sio::async::open_t;
     any_sender_of<connection_handle> open(sio::async::open_t);
