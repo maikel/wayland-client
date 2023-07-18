@@ -48,7 +48,7 @@ int main() {
   exec::io_uring_context io_context{};
 
   wayland::render_context renderer{io_context};
-  run_on(io_context, sio::async::run(renderer) | sio::ignore_all());
+  run_on(io_context, sio::async::use(renderer) | sio::ignore_all());
 
   // connection conn{context};
   // auto using_connection =

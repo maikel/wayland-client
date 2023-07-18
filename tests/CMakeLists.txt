@@ -1,0 +1,2 @@
+add_executable(test_connection test_connection.cpp)
+target_link_libraries(test_connection PRIVATE wayland)

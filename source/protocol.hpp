@@ -33,11 +33,12 @@ namespace wayland {
     void (*destroyed_)(object*) noexcept {nullptr};
   };
 
-  class display;
+  struct registry_context;
 
   class registry {
    public:
     registry() = default;
+    explicit registry(registry_context* impl);
 
     any_sequence_of<name, std::string_view, id> on_global();
     any_sequence_of<name> on_global_removal();
@@ -57,42 +58,37 @@ namespace wayland {
 
     std::optional<name> find_interface(std::string_view name) const;
 
+    friend auto operator<=>(const registry&, const registry&) noexcept = default;
+
    private:
-    friend class display;
-    explicit registry(void* impl);
-
     any_sequence_of<wayland::object, void*> bind(name which, std::span<event_handler> vtable);
-
-    void* impl_{nullptr};
+    registry_context* context_{nullptr};
   };
 
-  class display;
+  struct display_context;
 
   class display_handle {
    public:
+    display_handle();
+    explicit display_handle(display_context* resource) noexcept;
     any_sequence_of<registry> get_registry();
 
+    friend auto operator<=>(const display_handle&, const display_handle&) noexcept = default;
+
    private:
-    friend class sio::async::close_t;
-    any_sender_of<> close(sio::async::close_t) const;
-
-
-    friend class display;
-    explicit display_handle(void* resource) noexcept;
-    void* resource_;
+    display_context* context_;
   };
 
   class display {
    public:
-    display() = default;
+    display();
     explicit display(connection_handle connection);
 
    private:
-    friend class sio::async::open_t;
-    any_sender_of<display_handle> open(sio::async::open_t);
+    friend class sio::async::use_t;
+    any_sequence_of<display_handle> use(sio::async::use_t) const;
 
-   private:
-    connection_handle connection_;
+    connection_handle connection_{};
   };
 
   class surface {

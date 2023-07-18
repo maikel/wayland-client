@@ -54,8 +54,8 @@ namespace wayland {
     render_context(exec::io_uring_context& context);
 
    private:
-    friend class sio::async::run_t;
-    any_sequence_of<renderer> run(sio::async::run_t);
+    friend class sio::async::use_t;
+    any_sequence_of<renderer> use(sio::async::use_t);
 
     wayland::connection connection_;
     wayland::display display_{};

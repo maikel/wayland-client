@@ -29,12 +29,10 @@ namespace wayland {
 
   class connection_handle {
    private:
-    connection_context* connection_;
-
-    friend struct sio::async::close_t;
-    any_sender_of<> close(sio::async::close_t) const;
+    connection_context* connection_{};
 
    public:
+    connection_handle();
     explicit connection_handle(connection_context& connection);
 
     template <class Tp>
@@ -53,6 +51,8 @@ namespace wayland {
     any_sender_of<> send_with_fd(std::span<std::byte> buffer, int fd);
 
     any_sequence_of<std::span<std::byte>> subscribe();
+
+    auto operator<=>(const connection_handle&) const = default;
   };
 
   class connection {
@@ -62,8 +62,8 @@ namespace wayland {
    private:
     exec::io_uring_context* context_;
 
-    friend struct sio::async::open_t;
-    any_sender_of<connection_handle> open(sio::async::open_t);
+    friend struct sio::async::use_t;
+    any_sequence_of<connection_handle> use(sio::async::use_t) const;
   };
 
 }

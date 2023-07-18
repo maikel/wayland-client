@@ -8,12 +8,12 @@ namespace wayland {
     : connection_(ctx) {
   }
 
-  any_sequence_of<renderer> render_context::run(sio::async::run_t) {
+  any_sequence_of<renderer> render_context::use(sio::async::use_t) {
     return                         //
-      sio::async::run(connection_) //
+      sio::async::use(connection_) //
       | sio::then_each([this](connection_handle handle) {
           this->display_ = display(handle);
-          return sio::async::run(display_)       //
+          return sio::async::use(display_)       //
                | sio::then_each([this](auto display) {
                    return display.get_registry() //
                         | sio::then_each([this](wayland::registry registry) {

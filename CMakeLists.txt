@@ -4,10 +4,17 @@ project(wayland-client LANGUAGES CXX)
 find_package(sio REQUIRED)
 find_package(fmt REQUIRED)
 
-add_executable(wayland-client
+add_library(wayland
   source/connection.cpp
-  source/main.cpp
   source/logging.cpp
   source/protocol.cpp
   source/renderer.cpp)
-target_link_libraries(wayland-client PRIVATE sio::sio fmt::fmt)
+target_link_libraries(wayland PUBLIC sio::sio fmt::fmt)
+
+# add_executable(wayland-client
+#   source/main.cpp)
+# target_link_libraries(wayland-client PRIVATE wayland)
+
+# if (BUILD_TESTING)
+  add_subdirectory(tests)
+# endif()
