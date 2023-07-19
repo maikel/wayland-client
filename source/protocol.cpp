@@ -16,15 +16,517 @@
 #include "./protocol.hpp"
 #include "./logging.hpp"
 
+#include <sio/async_channel.hpp>
+
+#include <sio/io_uring/socket_handle.hpp>
+#include <sio/local/stream_protocol.hpp>
+
 #include <sio/sequence/empty_sequence.hpp>
 #include <sio/sequence/ignore_all.hpp>
+#include <sio/sequence/iterate.hpp>
 #include <sio/sequence/then_each.hpp>
 #include <sio/sequence/merge_each.hpp>
 
 #include <sio/tap.hpp>
 
+#include <exec/repeat_effect_until.hpp>
+#include <exec/variant_sender.hpp>
+
 namespace wayland {
   namespace {
+    struct object;
+
+    using event_handler = void (*)(object*, message_header, std::span<std::byte>) noexcept;
+
+    struct object {
+      std::span<event_handler> events_;
+      id id_{};
+      void (*destroyed_)(object*) noexcept {nullptr};
+    };
+
+    struct buffer_sentinel { };
+
+    message_header extract_header(std::span<std::byte> bytes) {
+      message_header header{};
+      if (bytes.size() >= sizeof(message_header)) {
+        std::memcpy(&header, bytes.data(), sizeof(message_header));
+      }
+      return header;
+    }
+
+    struct buffer_iterator {
+      std::span<std::byte> range_;
+      std::ptrdiff_t position_;
+
+      using iterator_category = std::forward_iterator_tag;
+      using value_type = std::span<std::byte>;
+      using difference_type = std::ptrdiff_t;
+
+      explicit buffer_iterator(std::span<std::byte> range, std::ptrdiff_t position = 0)
+        : range_(range)
+        , position_(position) {
+      }
+
+      buffer_iterator& operator++() noexcept {
+        message_header header = extract_header(range_.subspan(position_));
+        position_ += header.message_length;
+        return *this;
+      }
+
+      buffer_iterator operator++(int) noexcept {
+        buffer_iterator tmp = *this;
+        ++*this;
+        return tmp;
+      }
+
+      std::span<std::byte> operator*() const noexcept {
+        message_header header = extract_header(range_.subspan(position_));
+        return range_.subspan(position_, header.message_length);
+      }
+
+      bool operator==(const buffer_sentinel&) const noexcept {
+        return range_.size() < position_ + sizeof(message_header);
+      }
+
+      bool operator!=(const buffer_sentinel&) const noexcept {
+        return !(*this == buffer_sentinel{});
+      }
+    };
+
+    bool operator==(const buffer_sentinel&, const buffer_iterator& iter) noexcept {
+      return iter == buffer_sentinel{};
+    }
+
+    bool operator!=(const buffer_sentinel&, const buffer_iterator& iter) noexcept {
+      return !(iter == buffer_sentinel{});
+    }
+
+    static_assert(std::input_iterator<buffer_iterator>);
+    static_assert(std::sentinel_for<buffer_sentinel, buffer_iterator>);
+
+    using socket_type = sio::io_uring::socket<sio::local::stream_protocol>;
+    using socket_handle = sio::io_uring::socket_handle<sio::local::stream_protocol>;
+
+    using channel_type =
+      sio::async_channel<stdexec::completion_signatures<stdexec::set_value_t(std::span<std::byte>)>>;
+    using channel_handle = sio::async_channel_handle<
+      stdexec::completion_signatures<stdexec::set_value_t(std::span<std::byte>)>>;
+
+    struct connection_context_base {
+      connection_context_base() = default;
+
+      explicit connection_context_base(socket_handle sock, channel_handle chan)
+        : buffer_{}
+        , socket_{sock}
+        , channel_{chan} {
+      }
+
+      connection_context_base(const connection_context_base&) = delete;
+      connection_context_base& operator=(const connection_context_base&) = delete;
+
+      connection_context_base(connection_context_base&&) = delete;
+      connection_context_base& operator=(connection_context_base&&) = delete;
+
+      alignas(4096) std::array<std::byte, 8192> buffer_{};
+      socket_handle socket_{};
+      channel_handle channel_{};
+      stdexec::in_place_stop_source stop_source_{};
+      int ref_counter_{0};
+      void* complete_close_data_{nullptr};
+      void (*complete_close_)(void*) noexcept = nullptr;
+    };
+
+    template <class ThenSender, class ElseSender>
+    exec::variant_sender<ThenSender, ElseSender>
+      if_then_else(bool condition, ThenSender then, ElseSender otherwise) {
+      if (condition) {
+        return then;
+      }
+      return otherwise;
+    }
+
+    std::array<char, 2> to_hex(std::byte b) {
+      static constexpr const char map[] = "0123456789ABCDEF";
+      const auto c = std::bit_cast<unsigned char>(b);
+      std::array<char, 2> result;
+      result[0] = map[(c & 0xF0) >> 4];
+      result[1] = map[c & 0x0F];
+      return result;
+    }
+
+    std::string to_hex(std::span<std::byte, 4> bs) {
+      std::string result(8, '\0');
+      int counter = 0;
+      for (std::byte b: std::ranges::views::reverse(bs)) {
+        auto chars = to_hex(b);
+        result[counter++] = chars[0];
+        result[counter++] = chars[1];
+      }
+      return result;
+    }
+
+    char to_char(std::byte b) {
+      if (std::isprint(static_cast<int>(b))) {
+        return static_cast<char>(b);
+      } else {
+        return '.';
+      }
+    }
+
+    std::string to_chars(std::span<std::byte, 4> b) {
+      return std::string{to_char(b[0]), to_char(b[1]), to_char(b[2]), to_char(b[3])};
+    }
+
+    void consume_front(std::span<std::byte>& buffer, std::string& hex, std::string& ascii) {
+      if (buffer.size() >= 4) {
+        std::span<std::byte, 4> column = buffer.subspan<0, 4>();
+        hex = to_hex(column);
+        ascii = to_chars(column);
+        buffer = buffer.subspan(4);
+      }
+    }
+
+    void log_buffer(std::string prefix, std::span<std::byte> buffer) {
+      std::string first = prefix;
+      while (buffer.size() >= 4) {
+        std::array<std::string, 8> columns{};
+        consume_front(buffer, columns[0], columns[4]);
+        consume_front(buffer, columns[1], columns[5]);
+        consume_front(buffer, columns[2], columns[6]);
+        consume_front(buffer, columns[3], columns[7]);
+        log(
+          "connection",
+          "{:5} {:8} {:8} {:8} {:8} | {:4} {:4} {:4} {:4}",
+          first,
+          columns[0],
+          columns[1],
+          columns[2],
+          columns[3],
+          columns[4],
+          columns[5],
+          columns[6],
+          columns[7]);
+        first = "";
+      }
+    }
+
+    void log_send_buffer(std::span<std::byte> buffer) {
+      log_buffer("C->S:", buffer);
+    }
+
+    void log_recv_buffer(std::span<std::byte> buffer) {
+      log_buffer("S->C:", buffer);
+    }
+
+    enum process_result {
+      disconnected,
+      need_more,
+      processed,
+    };
+
+    auto notify_all_listeners(channel_handle channel, std::span<std::byte> message) {
+      return channel.notify_all(stdexec::just(message));
+    }
+
+    auto process_buffer(channel_handle channel, std::span<std::byte> buffer) {
+      return sio::reduce(
+        sio::iterate(std::ranges::subrange(buffer_iterator{buffer}, buffer_sentinel{})) //
+          | sio::let_value_each([=](std::span<std::byte> message) {
+              message_header header{};
+              std::memcpy(&header, message.data(), sizeof(message_header));
+              log(
+                "connection",
+                "Received message to Object ID: {}, Message length: {}, Opcode: {}",
+                static_cast<int>(header.object_id),
+                header.message_length,
+                header.opcode);
+              log_recv_buffer(message);
+              return stdexec::then(
+                channel.notify_all(stdexec::just(message)),
+                [len = header.message_length] { return len; });
+            }),
+        0);
+    }
+
+    auto receive_all_messages_until_disconnect(connection_context_base& context) {
+      return stdexec::just(std::span<std::byte>{}) //
+           | stdexec::let_value([&context](std::span<std::byte>& filled) {
+               std::span buffer{context.buffer_};
+               return sio::async::read_some(context.socket_, buffer.subspan(filled.size())) //
+                    | stdexec::let_value([&context, &filled, buffer](int n) {
+                        filled = buffer.subspan(0, filled.size() + n);
+                        return if_then_else(
+                          n == 0,
+                          stdexec::just() | stdexec::then([] {
+                            log("connection", "Disconnected from Wayland server.");
+                            return -1;
+                          }),
+                          process_buffer(context.channel_, filled));
+                      }) //
+                    | stdexec::then([&](int n) {
+                        if (n < 0) {
+                          return true;
+                        }
+                        auto consumed = filled.subspan(0, n);
+                        auto rest = filled.subspan(n);
+                        std::memmove(filled.data(), rest.data(), rest.size());
+                        filled = filled.subspan(0, rest.size());
+                        return false;
+                      })
+                    | exec::repeat_effect_until();
+             });
+    }
+
+    struct receive_all_receiver {
+      using is_receiver = void;
+
+      connection_context_base* context_;
+
+      auto get_env(stdexec::get_env_t) const noexcept {
+        return exec::make_env(
+          exec::with(stdexec::get_stop_token, context_->stop_source_.get_token()));
+      }
+
+      void set_value(stdexec::set_value_t) && noexcept {
+        context_->ref_counter_ -= 1;
+        if (context_->ref_counter_ == 0 && context_->complete_close_) {
+          (*context_->complete_close_)(context_->complete_close_data_);
+        }
+      }
+
+      void set_stopped(stdexec::set_stopped_t) && noexcept {
+        context_->ref_counter_ -= 1;
+        if (context_->ref_counter_ == 0 && context_->complete_close_) {
+          (*context_->complete_close_)(context_->complete_close_data_);
+        }
+      }
+
+      void set_error(stdexec::set_error_t, std::error_code err) && noexcept {
+        log("connection", "Error Code ({}): {}", err.value(), err.message());
+        context_->ref_counter_ -= 1;
+        if (context_->ref_counter_ == 0 && context_->complete_close_) {
+          (*context_->complete_close_)(context_->complete_close_data_);
+        }
+      }
+
+      void set_error(stdexec::set_error_t, std::exception_ptr err) && noexcept {
+        try {
+          std::rethrow_exception(err);
+        } catch (std::exception& e) {
+          log("connection", "Error: {}", e.what());
+        }
+        context_->ref_counter_ -= 1;
+        if (context_->ref_counter_ == 0 && context_->complete_close_) {
+          (*context_->complete_close_)(context_->complete_close_data_);
+        }
+      }
+    };
+
+    struct connection_context : connection_context_base {
+      using receive_all_sender =
+        decltype(receive_all_messages_until_disconnect(std::declval<connection_context_base&>()));
+
+      connection_context()
+        : connection_context_base{}
+        , receive_all_(stdexec::connect(
+            receive_all_messages_until_disconnect(*static_cast<connection_context_base*>(this)),
+            receive_all_receiver{static_cast<connection_context_base*>(this)})) {
+      }
+
+      connection_context(socket_handle sock, channel_handle chan)
+        : connection_context_base{sock, chan}
+        , receive_all_(stdexec::connect(
+            receive_all_messages_until_disconnect(*static_cast<connection_context_base*>(this)),
+            receive_all_receiver{static_cast<connection_context_base*>(this)})) {
+      }
+
+      stdexec::connect_result_t<receive_all_sender, receive_all_receiver> receive_all_;
+    };
+
+    template <class Receiver>
+    struct close_operation {
+      Receiver rcvr_;
+      connection_context* context_;
+
+      void start(stdexec::start_t) noexcept;
+    };
+
+    struct close_sender {
+      using is_sender = void;
+
+      connection_context* context_;
+
+      using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t()>;
+
+      template <class Receiver>
+      close_operation<Receiver> connect(stdexec::connect_t, Receiver rcvr) const {
+        return {std::move(rcvr), context_};
+      }
+    };
+
+    class connection_handle {
+     private:
+      connection_context* connection_{};
+
+     public:
+      connection_handle();
+      explicit connection_handle(connection_context& connection);
+
+      auto send(const std::span<std::byte>& buffer) {
+        if (buffer.size() < sizeof(message_header)) {
+          throw std::runtime_error("Buffer too small");
+        }
+        return stdexec::let_value(stdexec::just(buffer), [this](std::span<std::byte> buffer) {
+          message_header header{};
+          std::memcpy(&header, buffer.data(), sizeof(message_header));
+          log(
+            "connection",
+            "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
+            static_cast<int>(header.object_id),
+            header.message_length,
+            header.opcode);
+          return sio::async::write(connection_->socket_, buffer) //
+               | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+        });
+      }
+
+      template <class Tp>
+        requires stdexec::__not_decays_to<Tp, std::span<std::byte>>
+      auto send(Tp& msg) {
+        const std::span<std::byte> buffer(reinterpret_cast<std::byte*>(&msg), sizeof(Tp));
+        return send(buffer);
+      }
+
+      auto send_with_fd(std::span<std::byte> buffer, int fd) {
+        if (buffer.size() < sizeof(message_header)) {
+          throw std::runtime_error("Buffer too small");
+        }
+        return stdexec::let_value(
+          stdexec::just(buffer, ::iovec{}), [this, fd](std::span<std::byte> buffer, ::iovec& iov) {
+            message_header header{};
+            std::memcpy(&header, buffer.data(), sizeof(message_header));
+            log(
+              "connection",
+              "Sending message. Object ID: {}, Message length: {}, Opcode: {}, FD: {}",
+              static_cast<int>(header.object_id),
+              header.message_length,
+              header.opcode,
+              fd);
+            ::msghdr msg{};
+            iov.iov_base = buffer.data();
+            iov.iov_len = buffer.size();
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            ::cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+            ::memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+            msg.msg_controllen = cmsg->cmsg_len;
+            return sio::async::sendmsg(connection_->socket_, msg) //
+                 | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+          });
+      }
+
+      template <class Tp>
+        requires stdexec::__not_decays_to<Tp, std::span<std::byte>>
+      auto send_with_fd(Tp& msg, int fd) {
+        std::span<std::byte> buffer(reinterpret_cast<std::byte*>(&msg), sizeof(Tp));
+        return send_with_fd(buffer, fd);
+      }
+
+      auto subscribe() {
+        return connection_->channel_.subscribe();
+      }
+
+      auto operator<=>(const connection_handle&) const = default;
+    };
+
+    auto open_connection_context(connection_context* ctx) {
+      return stdexec::let_value(stdexec::just(), [ctx] {
+        const char* xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+        if (!xdg_runtime_dir) {
+          throw std::runtime_error("XDG_RUNTIME_DIR not set");
+        }
+        const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
+        if (!wayland_display) {
+          throw std::runtime_error("WAYLAND_DISPLAY not set");
+        }
+        const std::filesystem::path path = std::filesystem::path(xdg_runtime_dir) / wayland_display;
+        if (!std::filesystem::exists(path)) {
+          throw std::runtime_error("Wayland socket does not exist");
+        }
+        log("connection", "Connecting to the Wayland server socket '{}'...", path.c_str());
+        return stdexec::let_value(
+          sio::async::connect(ctx->socket_, sio::local::endpoint(path.c_str())), [ctx] {
+            log("connection", "Connected to the Wayland server.");
+            ctx->ref_counter_ += 1;
+            stdexec::start(ctx->receive_all_);
+            return stdexec::just(connection_handle{*ctx});
+          });
+      });
+    }
+
+    class connection {
+     public:
+      explicit connection(exec::io_uring_context& context)
+        : context_{&context} {
+      }
+
+     private:
+      exec::io_uring_context* context_;
+
+      friend struct sio::async::use_t;
+
+      auto use(sio::async::use_t) const {
+        auto context = sio::make_deferred<connection_context>();
+        return stdexec::let_value(
+                 stdexec::just(context),
+                 [io_context = context_](auto& ctx) {
+                   ctx();
+                   auto cptr = std::addressof(*ctx);
+                   auto seq =
+                     sio::tap(stdexec::just(cptr), close_sender{cptr})
+                     | sio::then_each([io_context](connection_context* ctx) {
+                         socket_type socket{*io_context};
+                         channel_type channel{};
+                         return sio::zip(sio::async::use(socket), sio::async::use(channel))
+                              | sio::let_value_each([ctx](socket_handle sock, channel_handle chan) {
+                                  ctx->socket_ = sock;
+                                  ctx->channel_ = chan;
+                                  return open_connection_context(ctx);
+                                });
+                       })
+                     | sio::merge_each();
+                   return stdexec::just(seq);
+                 })
+             | sio::merge_each();
+      }
+    };
+
+    template <class Receiver>
+    void close_operation<Receiver>::start(stdexec::start_t) noexcept {
+      if (context_->ref_counter_ == 0) {
+        log("connection", "Connection closed.");
+        stdexec::set_value(std::move(rcvr_));
+      } else {
+        context_->complete_close_data_ = this;
+        context_->complete_close_ = [](void* ptr) noexcept {
+          log("connection", "Connection closed.");
+          auto self = static_cast<close_operation*>(ptr);
+          stdexec::set_value(std::move(self->rcvr_));
+        };
+        log("connection", "Closing connection...");
+        context_->stop_source_.request_stop();
+      }
+    }
+
+    connection_handle::connection_handle() = default;
+
+    connection_handle::connection_handle(connection_context& context)
+      : connection_{&context} {
+    }
+
     template <class Fn>
     auto just_invoke(Fn fn) {
       return stdexec::then(stdexec::just(), std::move(fn));
@@ -64,6 +566,11 @@ namespace wayland {
     std::tuple<Tps...> extract(std::span<std::byte> buffer) noexcept {
       return {extract_and_advance<Tps>(buffer)...};
     }
+  }
+
+  struct display_context;
+
+  namespace {
 
     struct dispatch_receiver {
       using is_receiver = void;
@@ -120,11 +627,11 @@ namespace wayland {
     struct callback_base : object {
       callback_base(
         Receiver rcvr,
-        wayland::display_context* display,
+        display_context* display,
         std::span<event_handler> vtable) noexcept;
 
       Receiver receiver_;
-      wayland::display_context* display_;
+      display_context* display_;
       int op_counter_{0};
     };
 
@@ -167,28 +674,28 @@ namespace wayland {
         return vtable;
       }
 
-      callback(Receiver rcvr, wayland::display_context* display);
+      callback(Receiver rcvr, display_context* display);
 
       void start(stdexec::start_t) noexcept;
     };
-
-    struct callback_sender {
-      wayland::display_context* display_;
-
-      using is_sender = void;
-
-      using completion_signatures = stdexec::completion_signatures<
-        stdexec::set_value_t(),
-        stdexec::set_error_t(std::error_code),
-        stdexec::set_error_t(std::exception_ptr),
-        stdexec::set_stopped_t()>;
-
-      template <class Receiver>
-      callback<Receiver> connect(stdexec::connect_t, Receiver rcvr) const noexcept {
-        return callback<Receiver>{std::move(rcvr), display_};
-      }
-    };
   }
+
+  struct callback_sender {
+    display_context* display_;
+
+    using is_sender = void;
+
+    using completion_signatures = stdexec::completion_signatures<
+      stdexec::set_value_t(),
+      stdexec::set_error_t(std::error_code),
+      stdexec::set_error_t(std::exception_ptr),
+      stdexec::set_stopped_t()>;
+
+    template <class Receiver>
+    callback<Receiver> connect(stdexec::connect_t, Receiver rcvr) const noexcept {
+      return callback<Receiver>{std::move(rcvr), display_};
+    }
+  };
 
   struct display_context : object {
     // [event callbacks]
@@ -204,10 +711,6 @@ namespace wayland {
     // Constructors
 
     explicit display_context(connection_handle connection) noexcept;
-
-    ~display_context() {
-      log("display", "Destroying display context. ptr = {}", (void*) this);
-    }
 
     // Methods
 
@@ -267,87 +770,57 @@ namespace wayland {
   //   </event>
   // </interface>
 
-  // struct global {
-  //   wayland::name name;
-  //   std::string interface;
-  //   wayland::version version;
-  // };
+  struct global {
+    wayland::name name;
+    std::string interface;
+    wayland::version version;
+  };
 
-  // struct bind_message_t {
-  //   message_header header;
-  //   wayland::name which;
-  //   wayland::id new_id;
-  // };
+  struct bind_message_t {
+    message_header header;
+    wayland::name which;
+    wayland::id new_id;
+  };
 
-  // auto make_bind_sender(id registry_id, display_context* display, name which, object& obj) {
-  //   display->register_object(obj);
-  //   bind_message_t message{};
-  //   message.header.message_length = sizeof(bind_message_t);
-  //   message.header.object_id = display->id_;
-  //   message.header.opcode = 0;
-  //   message.which = which;
-  //   message.new_id = obj.id_;
-  //   return stdexec::let_value(stdexec::just(message), [display](bind_message_t& msg) {
-  //     return stdexec::when_all(display->connection_.send(msg), display->sync());
-  //   });
-  // }
+  auto make_bind_sender(id registry_id, display_context* display, name which, object& obj) {
+    display->register_object(obj);
+    bind_message_t message{};
+    message.header.message_length = sizeof(bind_message_t);
+    message.header.object_id = display->id_;
+    message.header.opcode = 0;
+    message.which = which;
+    message.new_id = obj.id_;
+    return stdexec::let_value(stdexec::just(message), [display](bind_message_t& msg) {
+      return stdexec::when_all(display->connection_.send(msg), display->sync());
+    });
+  }
 
-  // struct get_registry_t {
-  //   message_header header;
-  //   id new_id;
-  // };
+  struct registry_context : object {
+    static void
+      on_global(object* obj, message_header header, std::span<std::byte> message) noexcept;
+    static void
+      on_global_remove(object* obj, message_header header, std::span<std::byte> message) noexcept;
 
+    static std::span<event_handler, 2> get_vtable() noexcept;
 
-  // struct registry_;
+    using bind_sender_t = decltype(make_bind_sender(
+      id{},
+      std::declval<display_context*>(),
+      name{},
+      std::declval<object&>()));
 
-  // struct registry_handle {
-  //   registry_* impl_;
-  //   any_sender_of<> close(sio::async::close_t) const;
-  // };
+    explicit registry_context(display_context* display) noexcept;
 
-  // struct registry_ : object {
-  //   static void
-  //     on_global(object* obj, message_header header, std::span<std::byte> message) noexcept;
-  //   static void
-  //     on_global_remove(object* obj, message_header header, std::span<std::byte> message) noexcept;
+    bind_sender_t bind(name global, object& obj) const;
 
-  //   static std::span<event_handler, 2> get_vtable() noexcept;
-
-  //   explicit registry_(wayland::display_context* display) noexcept;
-
-  //   using bind_sender_t = decltype(make_bind_sender(
-  //     id{},
-  //     std::declval<wayland::display_context*>(),
-  //     name{},
-  //     std::declval<object&>()));
-
-  //   bind_sender_t bind(name global, object& obj) const;
-
-  //   auto open(sio::async::open_t) {
-  //     return sio::let_value_each(
-  //       stdexec::just(this, get_registry_t{}), [](registry_* impl, get_registry_t& message) {
-  //         impl->id_ = impl->display_->get_new_id();
-  //         log("registry", "Register registry object as id {}.", static_cast<int>(impl->id_));
-  //         impl->display_->register_object(*impl);
-  //         message.header.object_id = impl->display_->id_;
-  //         message.header.opcode = 1;
-  //         message.header.message_length = sizeof(get_registry_t);
-  //         message.new_id = impl->id_;
-  //         return stdexec::when_all(
-  //           impl->display_->connection_.send(message),
-  //           impl->display_->sync(),
-  //           stdexec::just(registry_handle{impl}));
-  //       });
-  //   }
-
-  //   wayland::display_context* display_;
-  //   std::vector<global> globals_;
-  // };
+    display_context* display_;
+    std::vector<global> globals_{};
+  };
 
   // struct shm_ : object {
   //   static std::span<event_handler, 0> get_vtable() noexcept;
 
-  //   explicit shm_(wayland::display_context* display) noexcept;
+  //   explicit shm_(display_context* display) noexcept;
   // };
 
   // // <interface name="wl_compositor" version="5">
@@ -365,7 +838,7 @@ namespace wayland {
   // struct compositor_ : object {
   //   static std::span<event_handler, 0> get_vtable() noexcept;
 
-  //   explicit compositor_(wayland::display_context* display) noexcept;
+  //   explicit compositor_(display_context* display) noexcept;
 
   //   create_surface_sender create_surface() const noexcept;
 
@@ -382,7 +855,7 @@ namespace wayland {
   template <class Receiver>
   callback_base<Receiver>::callback_base(
     Receiver rcvr,
-    wayland::display_context* display,
+    display_context* display,
     std::span<event_handler> vtable) noexcept
     : object{vtable}
     , receiver_(std::move(rcvr))
@@ -436,7 +909,7 @@ namespace wayland {
   // callback operation state
 
   template <class Receiver>
-  callback<Receiver>::callback(Receiver rcvr, wayland::display_context* display)
+  callback<Receiver>::callback(Receiver rcvr, display_context* display)
     : callback_base<Receiver>{std::move(rcvr), display, get_vtable()}
     , sync_message_{}
     , send_operation_{stdexec::connect(
@@ -623,23 +1096,26 @@ namespace wayland {
     : context_{context} {
   }
 
-  display::display() = default;
-
-  display::display(connection_handle connection)
-    : connection_{connection} {
+  display::display(exec::io_uring_context& context) noexcept
+    : context_{&context} {
   }
 
+  display::display() = default;
+
   any_sequence_of<display_handle> display::use(sio::async::use_t) const {
-    auto context = sio::make_deferred<display_context>(connection_);
-    return stdexec::let_value(
-             stdexec::just(context),
-             [](auto& ctx) {
-               ctx();
-               log("display", "Opened display.");
-               display_context* ptr = ctx.get();
-               auto seq = sio::tap(stdexec::just(display_handle{ptr}), close_display_sender{ptr});
-               return stdexec::just(seq);
-             })
+    connection conn(*context_);
+    return sio::async::use(conn) | sio::let_value_each([](connection_handle h) {
+             auto ctx = sio::make_deferred<display_context>(h);
+             return stdexec::just(
+               stdexec::just(ctx) | stdexec::let_value([](auto& ctx) {
+                 ctx();
+                 log("display", "Opened display.");
+                 display_context* ptr = ctx.get();
+                 return stdexec::just(
+                   sio::tap(stdexec::just(display_handle{ptr}), close_display_sender{ptr}));
+               })
+               | sio::merge_each());
+           })
          | sio::merge_each();
   }
 
@@ -671,110 +1147,141 @@ namespace wayland {
     return close_display_operation<Receiver>{this->display_, std::move(rcvr)};
   }
 
+  struct get_registry_t {
+    message_header header;
+    id new_id;
+  };
+
+  any_sequence_of<registry> display_handle::get_registry() const {
+    auto reg = sio::make_deferred<registry_context>(context_);
+    return stdexec::let_value(
+             stdexec::just(reg, get_registry_t{}),
+             [](auto& reg, get_registry_t& msg) {
+               log("display", "Creating registry object.");
+               reg();
+               registry_context* ctx = reg.get();
+               ctx->id_ = ctx->display_->get_new_id();
+               ctx->display_->register_object(*ctx);
+               msg.header.object_id = ctx->display_->id_;
+               msg.header.message_length = sizeof(get_registry_t);
+               msg.header.opcode = 1;
+               msg.new_id = ctx->id_;
+               auto open = stdexec::then(
+                 stdexec::when_all(ctx->display_->connection_.send(msg), ctx->display_->sync()),
+                 [ctx] {
+                   log("display", "Registry object created.");
+                   return registry{ctx};
+                 });
+               auto seq = sio::tap(std::move(open), just_invoke([ctx] {
+                                     log("registry", "Unregistering registry object.");
+                                     ctx->display_->unregister_object(*ctx);
+                                   }));
+               return stdexec::just(std::move(seq));
+             })
+         | sio::merge_each();
+  }
+
   /////////////////////////////////////////////////////////////////////////////
   //                                                    REGISTRY IMPLEMENTATION
 
-  // registry_::registry_(wayland::display_context* display) noexcept
-  //   : object{get_vtable(), id{}}
-  //   , display_{display} {
-  //   log("registry", "Creating registry object.");
+  registry_context::registry_context(display_context* display) noexcept
+    : object{get_vtable(), id{}}
+    , display_{display} {
+    log("registry", "Creating registry object.");
+  }
+
+  std::span<event_handler, 2> registry_context::get_vtable() noexcept {
+    static std::array<event_handler, 2> vtable = {&on_global, &on_global_remove};
+    return vtable;
+  }
+
+  void
+    registry_context::on_global(object* obj, message_header, std::span<std::byte> buffer) noexcept {
+    registry_context* self = static_cast<registry_context*>(obj);
+    auto [which, interface, ver] = extract<name, std::string_view, version>(buffer);
+    log(
+      "registry",
+      "New global object '{}': interface '{}' (version {})",
+      static_cast<int>(which),
+      interface,
+      static_cast<int>(ver));
+    self->globals_.push_back(global{which, std::string{interface}, ver});
+  }
+
+  void registry_context::on_global_remove(
+    object* obj,
+    message_header,
+    std::span<std::byte> buffer) noexcept {
+    registry_context* self = static_cast<registry_context*>(obj);
+    auto which = extract<name>(buffer);
+    log("registry", "Removed global object '{}'", static_cast<int>(which));
+    auto elem = std::find_if(
+      self->globals_.begin(), self->globals_.end(), [which](const global& g) {
+        return g.name == which;
+      });
+    if (elem != self->globals_.end()) {
+      self->globals_.erase(elem);
+    } else {
+      log("registry", "Global object '{}' was not found.", static_cast<int>(which));
+    }
+  }
+
+  registry::registry(registry_context* context)
+    : context_{context} {
+  }
+
+  struct bind_message {
+    message_header header;
+    name name;
+    id new_id;
+  };
+
+  // static auto register_object(registry_context* ctx, object& obj, name which) {
+  //   return stdexec::let_value(stdexec::just(), [ctx, &obj, which] {
+  //     auto elem = std::find_if(
+  //       ctx->globals_.begin(), ctx->globals_.end(), [which](const global& g) {
+  //         return g.name == which;
+  //       });
+  //     if (elem != ctx->globals_.end()) {
+  //       id new_id = ctx->display_->get_new_id();
+  //       obj.id_ = new_id;
+  //       log(
+  //         "registry",
+  //         "Binding interface '{}' to id '{}'.",
+  //         elem->interface,
+  //         static_cast<int>(which),
+  //         static_cast<int>(new_id));
+  //       ctx->display_->register_object(obj);
+  //     } else {
+  //       log("registry", "Binding object name '{}' which is not a global.", static_cast<int>(which));
+  //     }
+  //     return if_then_else(
+  //       elem != ctx->globals_.end(),
+  //       stdexec::just(&obj),
+  //       stdexec::just_error(std::make_error_code(std::errc::invalid_argument)));
+  //   });
   // }
 
-  // std::span<event_handler, 2> registry_::get_vtable() noexcept {
-  //   static std::array<event_handler, 2> vtable = {&on_global, &on_global_remove};
-  //   return vtable;
-  // }
-
-  // void registry_::on_global(object* obj, message_header, std::span<std::byte> buffer) noexcept {
-  //   registry_* self = static_cast<registry_*>(obj);
-  //   auto [which, interface, ver] = extract<name, std::string_view, version>(buffer);
-  //   log(
-  //     "registry",
-  //     "New global object '{}': interface '{}' (version {})",
-  //     static_cast<int>(which),
-  //     interface,
-  //     static_cast<int>(ver));
-  //   self->globals_.push_back(global{which, std::string{interface}, ver});
-  // }
-
-  // void
-  //   registry_::on_global_remove(object* obj, message_header, std::span<std::byte> buffer) noexcept {
-  //   registry_* self = static_cast<registry_*>(obj);
-  //   auto which = extract<name>(buffer);
-  //   log("registry", "Removed global object '{}'", static_cast<int>(which));
-  //   auto elem = std::find_if(
-  //     self->globals_.begin(), self->globals_.end(), [which](const global& g) {
-  //       return g.name == which;
-  //     });
-  //   if (elem != self->globals_.end()) {
-  //     self->globals_.erase(elem);
-  //   } else {
-  //     log("registry", "Global object '{}' was not found.", static_cast<int>(which));
-  //   }
-  // }
-
-  // registry::registry(void* impl)
-  //   : impl_{impl} {
-  // }
-
-  // struct bind_message {
-  //   message_header header;
-  //   name name;
-  //   id new_id;
-  // };
-
-  // struct registered_object {
-  //   object obj;
-  //   display_* display;
-
-  //   auto open(sio::async::open_t) {
-  //     return just_invoke([this] {
-  //       obj.id_ = display->get_new_id();
-  //       display->register_object(obj);
-  //       return *this;
-  //     });
-  //   }
-
-  //   auto close(sio::async::close_t) const {
-  //     return just_invoke([this] { //
-  //       display->unregister_object(obj);
-  //     });
-  //   }
-  // };
-
-  // any_sequence_of<object, void*> registry::bind(name which, std::span<event_handler> vtable) {
-  //   registry_* self = static_cast<registry_*>(this->impl_);
-  //   auto elem = std::find_if(
-  //     self->globals_.begin(), self->globals_.end(), [which](const global& g) {
-  //       return g.name == which;
-  //     });
-  //   if (elem != self->globals_.end()) {
-  //     log(
-  //       "registry",
-  //       "Binding interface '{}' to object name '{}'.",
-  //       elem->interface,
-  //       static_cast<int>(which));
-  //     object obj{vtable, id{}};
-  //     return stdexec::just(self, bind_message{}, registered_object{obj, self->display_}) //
-  //          | stdexec::let_value(
-  //              [which](registry_* self, bind_message& msg, registered_object& obj) {
-  //                return stdexec::just(sio::let_value_each(
-  //                  sio::async::run(obj), [&msg, which, self](registered_object obj) {
-  //                    msg.header.opcode = 0;
-  //                    msg.header.object_id = self->id_;
-  //                    msg.header.message_length = sizeof(bind_message);
-  //                    msg.name = which;
-  //                    msg.new_id = obj.obj.id_;
-  //                    return stdexec::when_all(
-  //                      self->display_->connection_.send(msg),
-  //                      stdexec::just(obj.obj, static_cast<void*>(self->display_)));
-  //                  }));
-  //              })
-  //          | sio::merge_each();
-  //   } else {
-  //     log("registry", "Interface '{}' was not found.", static_cast<int>(which));
-  //     return stdexec::just_error(std::make_error_code(std::errc::no_such_file_or_directory));
-  //   }
+  // any_sequence_of<object*> registry::bind(name which, object& base) const {
+  //   return stdexec::just(bind_message{}) //
+  //        | stdexec::let_value([which, context = context_, &base](bind_message& msg) {
+  //            auto register_object = sio::tap(
+  //              register_object(context, *obj, which), just_invoke([=] {
+  //                log("registry", "Unregistering object id='{}'.", obj->id_);
+  //                context->display_->unregister_object(*obj);
+  //              }));
+  //            return stdexec::just(
+  //              sio::let_value_each(std::move(register_object), [&msg, which, context](object* obj) {
+  //                msg.header.opcode = 0;
+  //                msg.header.object_id = context->id_;
+  //                msg.header.message_length = sizeof(bind_message);
+  //                msg.name = which;
+  //                msg.new_id = obj.id_;
+  //                return stdexec::when_all(
+  //                  context->display_->connection_.send(msg), stdexec::just(obj, context));
+  //              }));
+  //          })
+  //        | sio::merge_each();
   // }
 
   // std::optional<name> registry::find_interface(std::string_view name) const {
@@ -787,16 +1294,6 @@ namespace wayland {
   //   } else {
   //     return std::nullopt;
   //   }
-  // }
-
-  // any_sender_of<> registry_handle::close(sio::async::close_t) const {
-  //   return just_invoke([impl = this->impl_] {
-  //     log("registry", "Closing registry object.");
-  //     auto self = static_cast<registry_*>(impl);
-  //     wayland::display_context* d = self->display_;
-  //     d->unregister_object(*self);
-  //     delete self;
-  //   });
   // }
 
   // shm::shm(object obj, void* data)

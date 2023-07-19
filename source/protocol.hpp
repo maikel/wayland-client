@@ -16,52 +16,36 @@
 #pragma once
 
 #include "./any_sender_of.hpp"
-#include "./connection.hpp"
 #include "./construct.hpp"
 #include "./message_header.hpp"
 
+#include <sio/async_resource.hpp>
 #include <sio/sequence/then_each.hpp>
 
+#include <exec/linux/io_uring_context.hpp>
+
+#include <span>
+
 namespace wayland {
-  struct object;
-
-  using event_handler = void (*)(object*, message_header, std::span<std::byte>) noexcept;
-
-  struct object {
-    std::span<event_handler> events_;
-    id id_{};
-    void (*destroyed_)(object*) noexcept {nullptr};
-  };
-
   struct registry_context;
 
   class registry {
    public:
     registry() = default;
-    explicit registry(registry_context* impl);
+    explicit registry(registry_context* context);
 
     any_sequence_of<name, std::string_view, id> on_global();
     any_sequence_of<name> on_global_removal();
 
     template <class Tp>
-    any_sequence_of<Tp> bind() {
-      auto which = find_interface(Tp::interface_name);
-      if (which) {
-        return bind(*which, Tp::get_vtable())
-             | sio::then_each([](wayland::object obj, void* display) {
-                 return Tp{obj, display};
-               });
-      } else {
-        return stdexec::just_error(std::make_error_code(std::errc::invalid_argument));
-      }
-    }
+    any_sequence_of<Tp> bind() const { return Tp::bind(*context_); }
 
     std::optional<name> find_interface(std::string_view name) const;
 
     friend auto operator<=>(const registry&, const registry&) noexcept = default;
 
    private:
-    any_sequence_of<wayland::object, void*> bind(name which, std::span<event_handler> vtable);
+    // any_sequence_of<wayland::object, void*> bind(name which, std::span<event_handler> vtable);
     registry_context* context_{nullptr};
   };
 
@@ -71,7 +55,8 @@ namespace wayland {
    public:
     display_handle();
     explicit display_handle(display_context* resource) noexcept;
-    any_sequence_of<registry> get_registry();
+
+    any_sequence_of<registry> get_registry() const;
 
     friend auto operator<=>(const display_handle&, const display_handle&) noexcept = default;
 
@@ -82,100 +67,97 @@ namespace wayland {
   class display {
    public:
     display();
-    explicit display(connection_handle connection);
+    explicit display(exec::io_uring_context& ctx) noexcept;
 
    private:
     friend class sio::async::use_t;
     any_sequence_of<display_handle> use(sio::async::use_t) const;
 
-    connection_handle connection_{};
+    exec::io_uring_context* context_{};
   };
 
-  class surface {
-   public:
-    inline static const char* interface_name = "wl_surface";
-    static std::span<event_handler> get_vtable();
+  // class surface {
+  //  public:
+  //   inline static const char* interface_name = "wl_surface";
+  //   static std::span<event_handler> get_vtable();
 
-    surface() = default;
-    explicit surface(wayland::object object, wayland::display* display);
+  //   surface() = default;
+  //   explicit surface(wayland::object object, wayland::display* display);
 
-   private:
-    void* impl_{nullptr};
-  };
+  //  private:
+  //   void* impl_{nullptr};
+  // };
 
-  class region {
-   public:
-    inline static const char* interface_name = "wl_region";
-    static std::span<event_handler> get_vtable();
+  // class region {
+  //  public:
+  //   inline static const char* interface_name = "wl_region";
+  //   static std::span<event_handler> get_vtable();
 
-    region() = default;
-    explicit region(wayland::object object, wayland::display* display);
+  //   region() = default;
+  //   explicit region(wayland::object object, wayland::display* display);
 
-   private:
-    void* impl_;
-  };
+  //  private:
+  //   void* impl_;
+  // };
 
-  class buffer {
-   public:
-    inline static const char* interface_name = "wl_buffer";
-    static std::span<event_handler> get_vtable();
+  // class buffer {
+  //  public:
+  //   inline static const char* interface_name = "wl_buffer";
+  //   static std::span<event_handler> get_vtable();
 
-    buffer() = default;
-    explicit buffer(wayland::object object, wayland::display* display);
+  //   buffer() = default;
+  //   explicit buffer(wayland::object object, wayland::display* display);
 
-    any_sequence_of<> on_release();
+  //   any_sequence_of<> on_release();
 
-   private:
-    void* impl_;
-  };
+  //  private:
+  //   void* impl_;
+  // };
 
-  class shm;
+  // class shm;
 
-  class shm_pool {
-   public:
-    inline static const char* interface_name = "wl_shm_pool";
-    static std::span<event_handler> get_vtable();
+  // class shm_pool {
+  //  public:
+  //   inline static const char* interface_name = "wl_shm_pool";
+  //   static std::span<event_handler> get_vtable();
 
-    shm_pool() = default;
-    explicit shm_pool(wayland::object object, void* display);
+  //   shm_pool() = default;
+  //   explicit shm_pool(wayland::object object, void* display);
 
-    any_sequence_of<buffer>
-      create_buffer(int32_t offset, int32_t width, int32_t height, int32_t stride, uint32_t format);
+  //   any_sequence_of<buffer>
+  //     create_buffer(int32_t offset, int32_t width, int32_t height, int32_t stride, uint32_t format);
 
-   private:
-    friend class shm;
-    wayland::object obj_;
-    void* impl_{nullptr};
-  };
+  //  private:
+  //   friend class shm;
+  //   wayland::object obj_;
+  //   void* impl_{nullptr};
+  // };
 
-  class shm {
-   public:
-    inline static const char* interface_name = "wl_shm";
-    static std::span<event_handler> get_vtable();
+  // class shm {
+  //  public:
+  //   inline static const char* interface_name = "wl_shm";
+  //   static std::span<event_handler> get_vtable();
 
-    shm() = default;
-    explicit shm(wayland::object object, void* data);
+  //   shm() = default;
+  //   explicit shm(wayland::object object, void* data);
 
-    any_sequence_of<shm_pool> create_pool(int fd, int32_t size);
-   private:
-    wayland::object obj_;
-    void* impl_{nullptr};
-  };
+  //   any_sequence_of<shm_pool> create_pool(int fd, int32_t size);
+  //  private:
+  //   wayland::object obj_;
+  //   void* impl_{nullptr};
+  // };
+
+  struct compositor_context;
 
   class compositor {
    public:
-    inline static const char* interface_name = "wl_compositor";
-    static std::span<event_handler> get_vtable();
+    static any_sequence_of<compositor> bind(registry_context& registry);
 
-    compositor() = default;
-    explicit compositor(wayland::object object, void* data);
+    // any_sequence_of<surface> create_surface();
 
-    any_sequence_of<surface> create_surface();
-
-    any_sequence_of<region> create_region();
+    // any_sequence_of<region> create_region();
 
    private:
-    void* impl_{nullptr};
+    compositor_context* impl_{nullptr};
   };
-
 }
