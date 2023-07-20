@@ -377,16 +377,16 @@ namespace wayland {
           throw std::runtime_error("Buffer too small");
         }
         return stdexec::let_value(stdexec::just(buffer), [this](std::span<std::byte> buffer) {
-          message_header header{};
-          std::memcpy(&header, buffer.data(), sizeof(message_header));
+          message_header header = extract_header(buffer);
           log(
             "connection",
             "Sending message. Object ID: {}, Message length: {}, Opcode: {}",
             static_cast<int>(header.object_id),
             header.message_length,
             header.opcode);
-          return sio::async::write(connection_->socket_, buffer) //
-               | stdexec::then([buffer](std::size_t) { log_send_buffer(buffer); });
+          auto message = buffer.subspan(0, header.message_length);
+          return sio::async::write(connection_->socket_, message) //
+               | stdexec::then([message](std::size_t) { log_send_buffer(message); });
         });
       }
 
@@ -566,6 +566,32 @@ namespace wayland {
     std::tuple<Tps...> extract(std::span<std::byte> buffer) noexcept {
       return {extract_and_advance<Tps>(buffer)...};
     }
+
+    template <class Tp>
+      requires std::is_trivially_copyable_v<Tp>
+    std::span<std::byte> serialize_to(std::span<std::byte> buffer, const Tp& value) noexcept {
+      std::memcpy(buffer.data(), &value, sizeof(value));
+      return buffer.subspan(sizeof(value));
+    }
+
+    std::span<std::byte> serialize_to(std::span<std::byte> buffer, const std::string& str) noexcept {
+      const uint32_t length = str.size() + 1;
+      const uint32_t with_padding = (length + 7) & ~7;
+      buffer = serialize_to(buffer, length);
+      std::memcpy(buffer.data(), str.data(), str.size());
+      buffer = buffer.subspan(with_padding);
+      return buffer;
+    }
+
+    template <class... Args>
+    void serialize(std::span<std::byte> buffer, message_header header, Args... args) {
+      auto total_msg = buffer;
+      buffer = serialize_to(buffer, header);
+      ((buffer = serialize_to(buffer, args)), ...);
+      const uint32_t length = total_msg.size() - buffer.size();
+      header.message_length = length;
+      serialize_to(total_msg, header);
+    }
   }
 
   struct display_context;
@@ -724,7 +750,7 @@ namespace wayland {
 
     connection_handle connection_;
     std::vector<object*> objects_;
-    std::vector<uint32_t> free_ids_;
+    std::vector<id> free_ids_;
     using operation_type = decltype(make_dispatch_operation(
       std::declval<connection_handle&>().subscribe(),
       std::declval<std::vector<object*>&>(),
@@ -776,25 +802,6 @@ namespace wayland {
     wayland::version version;
   };
 
-  struct bind_message_t {
-    message_header header;
-    wayland::name which;
-    wayland::id new_id;
-  };
-
-  auto make_bind_sender(id registry_id, display_context* display, name which, object& obj) {
-    display->register_object(obj);
-    bind_message_t message{};
-    message.header.message_length = sizeof(bind_message_t);
-    message.header.object_id = display->id_;
-    message.header.opcode = 0;
-    message.which = which;
-    message.new_id = obj.id_;
-    return stdexec::let_value(stdexec::just(message), [display](bind_message_t& msg) {
-      return stdexec::when_all(display->connection_.send(msg), display->sync());
-    });
-  }
-
   struct registry_context : object {
     static void
       on_global(object* obj, message_header header, std::span<std::byte> message) noexcept;
@@ -803,15 +810,7 @@ namespace wayland {
 
     static std::span<event_handler, 2> get_vtable() noexcept;
 
-    using bind_sender_t = decltype(make_bind_sender(
-      id{},
-      std::declval<display_context*>(),
-      name{},
-      std::declval<object&>()));
-
     explicit registry_context(display_context* display) noexcept;
-
-    bind_sender_t bind(name global, object& obj) const;
 
     display_context* display_;
     std::vector<global> globals_{};
@@ -832,18 +831,49 @@ namespace wayland {
   // //     <arg name="id" type="new_id" interface="wl_region" summary="the new region"/>
   // //   </request>
   // // </interface>
-  // struct create_surface_sender;
-  // struct create_region_sender;
 
-  // struct compositor_ : object {
-  //   static std::span<event_handler, 0> get_vtable() noexcept;
 
-  //   explicit compositor_(display_context* display) noexcept;
+  struct compositor_context : object {
+    static std::span<event_handler, 0> get_vtable() noexcept {
+      return {};
+    }
 
-  //   create_surface_sender create_surface() const noexcept;
+    explicit compositor_context(display_context* display) noexcept
+      : object{get_vtable(), display->get_new_id()} {
+      display->register_object(*this);
+    }
+  };
 
-  //   create_region_sender create_region() const noexcept;
-  // };
+  any_sequence_of<compositor> compositor::bind(registry_context& registry) {
+    auto context = sio::make_deferred<compositor_context>(registry.display_);
+    return sio::let_value_each(stdexec::just(context), [&registry](auto& ctx) {
+      static constexpr auto interface = "wl_compositor";
+      auto it = std::ranges::find_if(registry.globals_, [](const global& g) {
+        return g.interface == interface;
+      });
+      return if_then_else(
+        it == registry.globals_.end(),
+        stdexec::just_error(std::make_error_code(std::errc::invalid_argument)),
+        stdexec::let_value(
+          stdexec::just(std::array<std::byte, 256>{}), [&ctx, &registry, it](std::array<std::byte, 256>& msg) {
+            compositor_context& context = ctx();
+            message_header header{.object_id = registry.id_, .opcode = 0};
+            serialize(msg, header, it->name, it->interface, it->version, context.id_);
+            auto open =
+              stdexec::when_all(registry.display_->connection_.send(msg))
+              | stdexec::then([&context] {
+                  log("compositor", "Created compositor with id '{}'", static_cast<int>(context.id_));
+                  return compositor{context};
+                });
+            auto seq = sio::tap(
+              std::move(open), just_invoke([&] {
+                log("compositor", "Destroy compositor with id '{}'", static_cast<int>(context.id_));
+                registry.display_->unregister_object(context);
+              }));
+            return stdexec::just(std::move(seq));
+          }));
+    }) | sio::merge_each();
+  }
 
   ///////////////////////////////////////////////////////////////////////////
   //                                                          IMPLEMENTATION
@@ -1024,7 +1054,7 @@ namespace wayland {
       }
       self->objects_[value] = nullptr;
     }
-    self->free_ids_.push_back(value);
+    self->free_ids_.push_back(which);
   }
 
   [[noreturn]] void display_context::on_destroyed_(object* obj) noexcept {
@@ -1068,7 +1098,7 @@ namespace wayland {
     assert(index > 0);
     assert(index <= objects_.size());
     index -= 1;
-    if (objects_[index]) {
+    if (objects_[index] == &obj) {
       objects_[index] = nullptr;
       log("display", "Unregistered object {}.", static_cast<int>(obj.id_));
     } else {
@@ -1080,9 +1110,9 @@ namespace wayland {
     if (free_ids_.empty()) {
       return static_cast<id>(objects_.size() + 1);
     } else {
-      uint32_t index = free_ids_.back();
+      id index = free_ids_.back();
       free_ids_.pop_back();
-      return id{index};
+      return index;
     }
   }
 
@@ -1117,6 +1147,10 @@ namespace wayland {
                | sio::merge_each());
            })
          | sio::merge_each();
+  }
+
+  any_sender_of<> display_handle::sync() const {
+    return context_->sync();
   }
 
   template <class Receiver>

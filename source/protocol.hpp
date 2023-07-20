@@ -58,6 +58,8 @@ namespace wayland {
 
     any_sequence_of<registry> get_registry() const;
 
+    any_sender_of<> sync() const;
+
     friend auto operator<=>(const display_handle&, const display_handle&) noexcept = default;
 
    private:
@@ -158,6 +160,9 @@ namespace wayland {
     // any_sequence_of<region> create_region();
 
    private:
-    compositor_context* impl_{nullptr};
+    explicit compositor(compositor_context& context) noexcept
+    : context_(&context) {}
+
+    compositor_context* context_{nullptr};
   };
 }
