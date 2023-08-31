@@ -17,6 +17,7 @@
 
 #include "./any_sender_of.hpp"
 #include "./construct.hpp"
+#include "./mdspan.hpp"
 #include "./message_header.hpp"
 
 #include <sio/async_resource.hpp>
@@ -27,29 +28,9 @@
 #include <span>
 
 namespace wayland {
-  struct registry_context;
-
-  class registry {
-   public:
-    registry() = default;
-    explicit registry(registry_context* context);
-
-    any_sequence_of<name, std::string_view, id> on_global();
-    any_sequence_of<name> on_global_removal();
-
-    template <class Tp>
-    any_sequence_of<Tp> bind() const { return Tp::bind(*context_); }
-
-    std::optional<name> find_interface(std::string_view name) const;
-
-    friend auto operator<=>(const registry&, const registry&) noexcept = default;
-
-   private:
-    // any_sequence_of<wayland::object, void*> bind(name which, std::span<event_handler> vtable);
-    registry_context* context_{nullptr};
-  };
-
   struct display_context;
+
+  class registry;
 
   class display_handle {
    public:
@@ -78,76 +59,106 @@ namespace wayland {
     exec::io_uring_context* context_{};
   };
 
-  // class surface {
-  //  public:
-  //   inline static const char* interface_name = "wl_surface";
-  //   static std::span<event_handler> get_vtable();
+  struct registry_context;
 
-  //   surface() = default;
-  //   explicit surface(wayland::object object, wayland::display* display);
+  class registry {
+   public:
+    registry() = default;
+    explicit registry(registry_context* context);
 
-  //  private:
-  //   void* impl_{nullptr};
-  // };
+    any_sequence_of<name, std::string_view, id> on_global();
+    any_sequence_of<name> on_global_removal();
 
-  // class region {
-  //  public:
-  //   inline static const char* interface_name = "wl_region";
-  //   static std::span<event_handler> get_vtable();
+    display_handle get_display() const;
 
-  //   region() = default;
-  //   explicit region(wayland::object object, wayland::display* display);
+    template <class Tp>
+    any_sequence_of<Tp> bind() const {
+      return Tp::bind(*context_);
+    }
 
-  //  private:
-  //   void* impl_;
-  // };
+    std::optional<name> find_interface(std::string_view name) const;
 
-  // class buffer {
-  //  public:
-  //   inline static const char* interface_name = "wl_buffer";
-  //   static std::span<event_handler> get_vtable();
+    friend auto operator<=>(const registry&, const registry&) noexcept = default;
 
-  //   buffer() = default;
-  //   explicit buffer(wayland::object object, wayland::display* display);
+   private:
+    // any_sequence_of<wayland::object, void*> bind(name which, std::span<event_handler> vtable);
+    registry_context* context_{nullptr};
+  };
 
-  //   any_sequence_of<> on_release();
+  struct buffer_context;
 
-  //  private:
-  //   void* impl_;
-  // };
+  class buffer {
+   public:
+    buffer() = default;
+    explicit buffer(buffer_context& context) noexcept;
+
+    void* data() const noexcept;
+    dynamic_extents<2> extents() const noexcept;
+    uint32_t format() const noexcept;
+
+    id id() const noexcept;
+
+   private:
+    buffer_context* context_;
+  };
 
   // class shm;
 
-  // class shm_pool {
-  //  public:
-  //   inline static const char* interface_name = "wl_shm_pool";
-  //   static std::span<event_handler> get_vtable();
+  struct shm_pool_context;
 
-  //   shm_pool() = default;
-  //   explicit shm_pool(wayland::object object, void* display);
+  class shm_pool {
+   public:
+    shm_pool() = default;
+    explicit shm_pool(shm_pool_context& context) noexcept;
 
-  //   any_sequence_of<buffer>
-  //     create_buffer(int32_t offset, int32_t width, int32_t height, int32_t stride, uint32_t format);
+    any_sequence_of<buffer>
+      create_buffer(int32_t offset, dynamic_extents<2> extents, uint32_t format = 0);
 
-  //  private:
-  //   friend class shm;
-  //   wayland::object obj_;
-  //   void* impl_{nullptr};
-  // };
+   private:
+    shm_pool_context* context_{nullptr};
+  };
 
-  // class shm {
-  //  public:
-  //   inline static const char* interface_name = "wl_shm";
-  //   static std::span<event_handler> get_vtable();
+  struct shm_context;
 
-  //   shm() = default;
-  //   explicit shm(wayland::object object, void* data);
+  class shm {
+   public:
+    static any_sequence_of<shm> bind(registry_context& registry);
 
-  //   any_sequence_of<shm_pool> create_pool(int fd, int32_t size);
-  //  private:
-  //   wayland::object obj_;
-  //   void* impl_{nullptr};
-  // };
+    shm() = default;
+
+    explicit shm(shm_context& context) noexcept
+      : context_(&context) {
+    }
+
+    any_sequence_of<shm_pool> create_pool(int fd, int32_t size);
+
+   private:
+    shm_context* context_{nullptr};
+  };
+
+  struct surface_context;
+
+  struct position {
+    int32_t x;
+    int32_t y;
+  };
+
+  class surface {
+   public:
+    surface();
+    explicit surface(surface_context& context) noexcept;
+
+    id id() const noexcept;
+
+    any_sender_of<> attach(buffer buffer, position offset) const;
+
+    any_sender_of<> damage(position offset, dynamic_extents<2> size) const;
+
+    any_sender_of<> commit() const;
+
+   private:
+    surface_context* context_{nullptr};
+  };
 
   struct compositor_context;
 
@@ -155,14 +166,85 @@ namespace wayland {
    public:
     static any_sequence_of<compositor> bind(registry_context& registry);
 
-    // any_sequence_of<surface> create_surface();
+    any_sequence_of<surface> create_surface();
 
     // any_sequence_of<region> create_region();
 
-   private:
     explicit compositor(compositor_context& context) noexcept
-    : context_(&context) {}
+      : context_(&context) {
+    }
 
+   private:
     compositor_context* context_{nullptr};
+  };
+
+  class xdg_toplevel;
+  class xdg_surface;
+
+  struct xdg_wm_base_context;
+
+  class xdg_wm_base {
+   public:
+    static any_sequence_of<xdg_wm_base> bind(registry_context& registry);
+
+    any_sequence_of<xdg_surface> get_xdg_surface(surface surface);
+
+    xdg_wm_base();
+    explicit xdg_wm_base(xdg_wm_base_context& context) noexcept;
+
+   private:
+    xdg_wm_base_context* context_{nullptr};
+  };
+
+  struct xdg_surface_context;
+
+  class xdg_surface {
+   public:
+    xdg_surface() = default;
+
+    explicit xdg_surface(xdg_surface_context* context) noexcept;
+
+    any_sequence_of<xdg_toplevel> get_toplevel() const;
+
+    any_sequence_of<uint32_t> on_configure() const;
+
+    any_sender_of<> set_window_geometry(position pos, dynamic_extents<2> size) const;
+
+    any_sender_of<> ack_configure(uint32_t serial) const;
+
+   private:
+    xdg_surface_context* context_{nullptr};
+  };
+
+  struct xdg_toplevel_context;
+
+  class xdg_toplevel {
+   public:
+    xdg_toplevel() = default;
+
+    explicit xdg_toplevel(xdg_toplevel_context* context) noexcept;
+
+    any_sequence_of<uint32_t> on_configure() const;
+
+    any_sender_of<> set_title(std::string title) const;
+
+    any_sender_of<> set_app_id(std::string app_id) const;
+
+    any_sender_of<> set_max_size(dynamic_extents<2> size) const;
+
+    any_sender_of<> set_min_size(dynamic_extents<2> size) const;
+
+    any_sender_of<> set_maximized() const;
+
+    any_sender_of<> unset_maximized() const;
+
+    any_sender_of<> set_fullscreen() const;
+
+    any_sender_of<> unset_fullscreen() const;
+
+    any_sender_of<> set_minimized() const;
+
+   private:
+    xdg_toplevel_context* context_{nullptr};
   };
 }

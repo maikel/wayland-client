@@ -4718,6 +4718,25 @@ private:
 } // end namespace MDSPAN_IMPL_STANDARD_NAMESPACE
 //END_FILE_INCLUDE: /home/runner/work/mdspan/mdspan/include/experimental/__p1684_bits/mdarray.hpp
 
+
+namespace wayland {
+namespace stdx = std::experimental;
+
+namespace detail {
+template <std::size_t... Is>
+auto make_dynamic_extents(std::index_sequence<Is...>) {
+  return stdx::extents<std::size_t, ((void) Is, std::dynamic_extent)...>{};
+}
+}  // namespace detail
+
+
+template <std::size_t N>
+using dynamic_extents = decltype(detail::make_dynamic_extents(std::make_index_sequence<N>{}));
+
+template <class T, std::size_t N>
+using mdspan = stdx::mdspan<T, dynamic_extents<N>, stdx::layout_left>;
+}
+
 #endif // MDARRAY_HPP_
 //END_FILE_INCLUDE: /home/runner/work/mdspan/mdspan/include/mdspan/mdarray.hpp
 //END_FILE_INCLUDE: /home/runner/work/mdspan/mdspan/include/experimental/mdarray

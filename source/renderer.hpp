@@ -16,13 +16,9 @@
 #pragma once
 
 #include "./protocol.hpp"
+#include "./font.hpp"
 
 namespace wayland {
-
-  struct position {
-    int32_t x;
-    int32_t y;
-  };
 
   struct rectangle {
     int32_t width;
@@ -34,36 +30,43 @@ namespace wayland {
     uint8_t green;
     uint8_t blue;
     uint8_t alpha;
+
+    static color black() noexcept {
+      return {0x00, 0x00, 0x00, 0xFF};
+    }
   };
 
-  class render_context;
+  struct render_context;
 
-  class renderer {
+  class renderer_handle {
    public:
-    void draw(rectangle rect, position pos, color col) const;
+    explicit renderer_handle(render_context& context) noexcept;
 
-    void render() const;
+    void draw_rectangle(position lower, position upper, color fill) const noexcept;
+
+    void draw_text(std::string_view text, position pos, color fill) const noexcept;
+
+    void render() const noexcept;
 
    private:
-    friend class render_context;
     render_context* context_;
   };
 
-  class render_context {
+  struct renderer_options {
+    int width;
+    int height;
+    color background;
+  };
+
+  class renderer {
    public:
-    render_context(exec::io_uring_context& context);
+    renderer(exec::io_uring_context& context, renderer_options opts) noexcept;
 
    private:
     friend class sio::async::use_t;
-    any_sequence_of<renderer> use(sio::async::use_t);
+    any_sequence_of<renderer_handle> use(sio::async::use_t) noexcept;
 
-    wayland::connection connection_;
-    wayland::display display_{};
-    wayland::registry registry_{};
-    wayland::compositor compositor_{};
-    wayland::shm shm_{};
-    wayland::shm_pool pool_{};
-    wayland::buffer buffer_{};
+    exec::io_uring_context* context_;
+    renderer_options opts_;
   };
-
 }
