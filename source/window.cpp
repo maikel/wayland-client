@@ -22,11 +22,29 @@ namespace wayland {
     display_handle display{};
     mouse_channel_handle mouse_events{};
     wayland::registry registry{};
+    wayland::compositor compositor{};
+    wayland::shm shm{};
+    wayland::shm_pool shm_pool{};
     wayland::buffer buffer{};
     wayland::surface surface{};
     wayland::xdg_wm_base wm_base{};
     wayland::xdg_surface xdg_surface{};
+    wayland::xdg_toplevel xdg_toplevel{};
   };
+
+  auto make_buffer(window_context& ctx, wayland::registry r, dynamic_extents<2> extents) {
+    return                                                  //
+      just_invoke([r]() { return r.bind<wayland::shm>(); }) //
+      | sio::merge_each()                                   //
+      | then_use([&ctx, extents](wayland::shm shm) {
+          ctx.shm = shm;
+          return shm.create_pool(fd, size);
+        }) //
+      | then_use([&ctx](wayland::shm_pool pool) {
+          ctx.shm_pool = pool;
+          return pool.create_buffer(0, wayland::dynamic_extents<2>{640, 480});
+        });
+  }
 
   any_sequence_of<window> make_window(exec::io_uring_context& ioc) {
     return                                                     //
@@ -47,9 +65,12 @@ namespace wayland {
       | sio::merge_each() //
       | then_use([](window_context* window_ctx, wayland::registry registry) {
           window_ctx->registry = registry;
-          auto get_surface =
-            registry.bind<wayland::compositor>() //
-            | then_use([](wayland::compositor compositor) { return compositor.create_surface(); });
+          auto get_surface = registry.bind<wayland::compositor>() //
+                           | then_use([window_ctx](wayland::compositor compositor) {
+                               window_ctx->compositor = compositor;
+                               return compositor.create_surface();
+                             });
+          auto get_buffer = make_buffer(*window_ctx, registry, dynamic_extents<2>{640, 480});
           return sio::zip(
             stdexec::just(window_ctx),
             registry.bind<wayland::xdg_wm_base>(),
@@ -59,10 +80,15 @@ namespace wayland {
         [](window_context* window_ctx, wayland::xdg_wm_base wm_base, wayland::surface surface) {
           window_ctx->wm_base = wm_base;
           window_ctx->surface = surface;
+          // return window{window_ctx};
           return sio::zip(stdexec::just(window_ctx), wm_base.get_xdg_surface(surface));
-        }) //
-      | sio::then_each([](window_context* window_ctx, wayland::xdg_surface xdg_surface) {
+        })
+      | then_use([](window_context* window_ctx, wayland::xdg_surface xdg_surface) {
           window_ctx->xdg_surface = xdg_surface;
+          return sio::zip(stdexec::just(window_ctx), xdg_surface.get_toplevel());
+        })
+      | sio::then_each([](window_context* window_ctx, wayland::xdg_toplevel xdg_toplevel) {
+          window_ctx->xdg_toplevel = xdg_toplevel;
           return window{window_ctx};
           // return sio::zip(stdexec::just(window_ctx), xdg_surface.get_toplevel());
         });

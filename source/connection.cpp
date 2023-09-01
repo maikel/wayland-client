@@ -15,10 +15,16 @@
 
 #include <sio/tap.hpp>
 
+#include <exec/finally.hpp>
 #include <exec/repeat_effect_until.hpp>
 #include <exec/variant_sender.hpp>
 
 namespace wayland {
+  template <class Fn>
+  auto just_invoke(Fn fn) {
+    return stdexec::then(stdexec::just(), std::move(fn));
+  }
+
   struct buffer_sentinel { };
 
   message_header extract_header(std::span<std::byte> bytes) {
@@ -353,7 +359,12 @@ namespace wayland {
         header.opcode);
       auto message = buffer.subspan(0, header.message_length);
       return sio::async::write(connection_->socket_, message) //
-           | stdexec::then([message](std::size_t) { log_send_buffer(message); });
+           | stdexec::then([message](std::size_t) { log_send_buffer(message); })
+           | stdexec::let_stopped([message] {
+               log("wayland::connection", "Stopped sending message:");
+               log_send_buffer(message);
+               return stdexec::just_stopped();
+             });
     });
   }
 

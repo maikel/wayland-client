@@ -150,6 +150,8 @@ namespace wayland {
 
     id id() const noexcept;
 
+    surface_context* context() const noexcept;
+
     any_sender_of<> attach(buffer buffer, position offset) const;
 
     any_sender_of<> damage(position offset, dynamic_extents<2> size) const;
@@ -169,6 +171,8 @@ namespace wayland {
     any_sequence_of<surface> create_surface();
 
     // any_sequence_of<region> create_region();
+
+    compositor();
 
     explicit compositor(compositor_context& context) noexcept
       : context_(&context) {
@@ -202,7 +206,7 @@ namespace wayland {
    public:
     xdg_surface() = default;
 
-    explicit xdg_surface(xdg_surface_context* context) noexcept;
+    explicit xdg_surface(xdg_surface_context& context) noexcept;
 
     any_sequence_of<xdg_toplevel> get_toplevel() const;
 
@@ -220,9 +224,9 @@ namespace wayland {
 
   class xdg_toplevel {
    public:
-    xdg_toplevel() = default;
+    xdg_toplevel() noexcept;
 
-    explicit xdg_toplevel(xdg_toplevel_context* context) noexcept;
+    explicit xdg_toplevel(xdg_toplevel_context& context) noexcept;
 
     any_sequence_of<uint32_t> on_configure() const;
 

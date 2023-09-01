@@ -86,7 +86,7 @@ namespace wayland {
     std::string_view extract_and_advance<std::string_view>(std::span<std::byte>& buffer) noexcept {
       std::string_view result = extract<std::string_view>(buffer);
       const uint32_t length = extract<uint32_t>(buffer);
-      const uint32_t with_padding = (length + 7) & ~7;
+      const uint32_t with_padding = (length + 3) & ~3;
       buffer = buffer.subspan(4 + with_padding);
       return result;
     }
@@ -107,7 +107,7 @@ namespace wayland {
     std::span<std::byte>
       serialize_to(std::span<std::byte> buffer, const std::string& str) noexcept {
       const uint32_t length = str.size() + 1;
-      const uint32_t with_padding = (length + 7) & ~7;
+      const uint32_t with_padding = (length + 3) & ~3;
       buffer = serialize_to(buffer, length);
       std::memcpy(buffer.data(), str.data(), str.size());
       buffer = buffer.subspan(with_padding);
@@ -371,6 +371,7 @@ namespace wayland {
   // //   </request>
   // // </interface>
 
+  compositor::compositor() = default;
 
   struct compositor_context : object {
     using token_type = compositor;
@@ -1123,15 +1124,13 @@ namespace wayland {
       stdexec::just(context) //
       | sio::let_value_each([](auto& ctx) {
           surface_context& context = ctx();
-          auto sequence = //
-            open(context) //
-            | stdexec::then([&context](surface s) {
-                return sio::finally(stdexec::just(s), destroy(context));
-              }) //
-            | sio::merge_each();
-          return stdexec::just(std::move(sequence));
+          return stdexec::just(sio::tap(open(context), destroy(context)));
         })
       | sio::merge_each();
+  }
+
+  surface_context* surface::context() const noexcept {
+    return context_;
   }
 
   struct attach_msg {
@@ -1257,7 +1256,24 @@ namespace wayland {
   struct xdg_surface_context : object {
 
     static any_sender_of<>
-      on_configure(object* self, message_header hdr, std::span<std::byte> payload);
+      on_configure(object* self, message_header hdr, std::span<std::byte> payload) noexcept;
+
+    static std::span<const event_handler, 1> get_vtable() noexcept {
+      static std::array<event_handler, 1> vtable = {&on_configure};
+      return vtable;
+    }
+
+    explicit xdg_surface_context(xdg_wm_base_context* wm_base, surface_context* surface)
+      : object{get_vtable(), wm_base->display_->get_new_id()}
+      , xdg_wm_base_{wm_base}
+      , surface_{surface} {
+      log("xdg_surface", "Registering xdg_surface object.");
+      wm_base->display_->register_object(*this);
+    }
+
+    display_context* display() const noexcept {
+      return xdg_wm_base_->display_;
+    }
 
     xdg_wm_base_context* xdg_wm_base_;
     surface_context* surface_;
@@ -1266,24 +1282,164 @@ namespace wayland {
     dynamic_extents<2> extents{0, 0};
   };
 
+  enum XDG_SURFACE_MSG {
+    XDG_SURFACE_DESTROY,
+    XDG_SURFACE_GET_TOPLEVEL,
+    XDG_SURFACE_GET_POPUP,
+    XDG_SURFACE_SET_WINDOW_GEOMETRY,
+    XDG_SURFACE_ACK_CONFIGURE
+  };
+
+  xdg_surface::xdg_surface(xdg_surface_context& context) noexcept
+    : context_{&context} {
+  }
+
   struct get_xdg_surface_msg {
     message_header header;
     id new_id;
     id surface_id;
   };
 
-  // static auto open(xdg_surface_context& context) {
-  //   return                                 //
-  //     stdexec::just(get_xdg_surface_msg{}) //
-  //     | stdexec::let_value([&](get_xdg_surface_msg& msg) {
-  //         msg.header.opcode = XDG_WM_BASE_GET_XDG_SURFACE;
-  //         msg.header.object_id = context.xdg_wm_base_.id_;
-  //         msg.header.message_length = sizeof(get_xdg_surface_msg);
-  //         return context.xdg_wm_base_.display_->connection_.send(msg) //
-  //              | stdexec::then([&]() {
-  //                  log("xdg_surface", "Opened xdg_surface object.");
-  //                  return xdg_surface{context};
-  //                });
-  //       });
-  // }
+  static auto open(xdg_surface_context& context) {
+    return                                 //
+      stdexec::just(get_xdg_surface_msg{}) //
+      | stdexec::let_value([&](get_xdg_surface_msg& msg) {
+          msg.header.opcode = XDG_WM_BASE_GET_XDG_SURFACE;
+          msg.header.object_id = context.xdg_wm_base_->id_;
+          msg.new_id = context.id_;
+          msg.surface_id = context.surface_->id_;
+          msg.header.message_length = sizeof(get_xdg_surface_msg);
+          return context.xdg_wm_base_->display_->connection_.send(msg) //
+               | stdexec::then([&]() {
+                   log("xdg_surface", "Opened xdg_surface object.");
+                   return xdg_surface{context};
+                 });
+        });
+  }
+
+  static auto destroy(xdg_surface_context& context) {
+    return stdexec::just(message_header{}) //
+         | stdexec::let_value([&](message_header& msg) {
+             msg.opcode = XDG_SURFACE_DESTROY;
+             msg.object_id = context.id_;
+             msg.message_length = sizeof(message_header);
+             return context.xdg_wm_base_->display_->connection_.send(msg);
+           });
+  }
+
+  any_sequence_of<xdg_surface> xdg_wm_base::get_xdg_surface(surface surface) {
+    auto context = sio::make_deferred<xdg_surface_context>(context_, surface.context());
+    return stdexec::just(context) //
+         | sio::let_value_each([](auto& ctx) {
+             xdg_surface_context& context = ctx();
+             return stdexec::just(sio::tap(open(context), destroy(context)));
+           })
+         | sio::merge_each();
+  }
+
+  any_sender_of<>
+    xdg_surface_context::on_configure(object*, message_header, std::span<std::byte>) noexcept {
+    log("xdg_surface", "Received configure.");
+    return stdexec::just();
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
+  //                                                XDG_TOPLEVEL IMPLEMENTATION
+
+  enum XDG_TOPLEVEL_MSG {
+    XDG_TOPLEVEL_DESTROY,
+    XDG_TOPLEVEL_SET_PARENT,
+    XDG_TOPLEVEL_SET_TITLE,
+    XDG_TOPLEVEL_SET_APP_ID,
+    XDG_TOPLEVEL_SHOW_WINDOW_MENU,
+    XDG_TOPLEVEL_MOVE,
+    XDG_TOPLEVEL_RESIZE,
+    XDG_TOPLEVEL_SET_MAX_SIZE,
+    XDG_TOPLEVEL_SET_MIN_SIZE,
+    XDG_TOPLEVEL_SET_MAXIMIZED,
+    XDG_TOPLEVEL_UNSET_MAXIMIZED,
+    XDG_TOPLEVEL_SET_FULLSCREEN,
+    XDG_TOPLEVEL_UNSET_FULLSCREEN,
+    XDG_TOPLEVEL_SET_MINIMIZED,
+  };
+
+  struct xdg_toplevel_context : object {
+    static any_sender_of<> on_configure(object*, message_header, std::span<std::byte>) noexcept {
+      return just_invoke([] { log("xdg_toplevel", "Received configure."); });
+    }
+
+    static any_sender_of<> on_close(object*, message_header, std::span<std::byte>) noexcept {
+      return just_invoke([] { log("xdg_toplevel", "Received close."); });
+    }
+
+    static any_sender_of<>
+      on_configure_bounds(object*, message_header, std::span<std::byte>) noexcept {
+      return just_invoke([] { log("xdg_toplevel", "Received configure_bounds."); });
+    }
+
+    static any_sender_of<>
+      on_wm_capabilities(object*, message_header, std::span<std::byte>) noexcept {
+      return just_invoke([] { log("xdg_toplevel", "Received wm_capabilities."); });
+    }
+
+    static std::span<const event_handler, 4> get_vtable() noexcept {
+      static std::array<event_handler, 4> vtable = {
+        &on_configure, &on_close, &on_configure_bounds, &on_wm_capabilities};
+      return vtable;
+    }
+
+    xdg_toplevel_context(xdg_surface_context* surface) noexcept
+      : object{get_vtable(), surface->display()->get_new_id()}
+      , surface_{surface} {
+    }
+
+    xdg_surface_context* surface_;
+  };
+
+  struct get_toplevel_msg {
+    message_header header;
+    id new_id;
+  };
+
+  xdg_toplevel::xdg_toplevel() noexcept = default;
+
+  xdg_toplevel::xdg_toplevel(xdg_toplevel_context& context) noexcept
+    : context_{&context} {
+  }
+
+  static auto open(xdg_toplevel_context& context) {
+    return                              //
+      stdexec::just(get_toplevel_msg{}) //
+      | stdexec::let_value([&](get_toplevel_msg& msg) {
+          msg.header.opcode = XDG_SURFACE_GET_TOPLEVEL;
+          msg.header.object_id = context.surface_->id_;
+          msg.new_id = context.id_;
+          msg.header.message_length = sizeof(get_toplevel_msg);
+          return context.surface_->display()->connection_.send(msg) //
+               | stdexec::then([&]() {
+                   log("xdg_toplevel", "Opened xdg_toplevel object.");
+                   return xdg_toplevel{context};
+                 });
+        });
+  }
+
+  static auto close(xdg_toplevel_context& context) {
+    return stdexec::just(message_header{}) //
+         | stdexec::let_value([&](message_header& msg) {
+             msg.opcode = XDG_TOPLEVEL_DESTROY;
+             msg.object_id = context.id_;
+             msg.message_length = sizeof(message_header);
+             return context.surface_->display()->connection_.send(msg);
+           });
+  }
+
+  any_sequence_of<xdg_toplevel> xdg_surface::get_toplevel() const {
+    auto context = sio::make_deferred<xdg_toplevel_context>(context_);
+    return stdexec::just(context) //
+         | sio::let_value_each([](auto& ctx) {
+             xdg_toplevel_context& context = ctx();
+             return stdexec::just(sio::tap(open(context), close(context)));
+           })
+         | sio::merge_each();
+  }
 }
